@@ -1,0 +1,1155 @@
+// ORLA client. One module for every page; each page block runs only where it belongs.
+import * as E from '/assets/engine.js';
+
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => [...r.querySelectorAll(s)];
+const PAGE = document.body.dataset.page;
+const O = window.ORLA || {};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const esc = (s) => String(s ?? '').replace(/[<&>"']/g, (c) => ({ '<': '&lt;', '&': '&amp;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+// ------------------------------------------------------------------ formatting
+const fmtUsd = (v, d) => {
+  if (v == null || !isFinite(v)) return '—';
+  const a = Math.abs(v);
+  const dec = d ?? (a >= 1000 ? 2 : a >= 1 ? 2 : a >= 0.01 ? 4 : 8);
+  return (v < 0 ? '-$' : '$') + a.toLocaleString('en-US', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+};
+const fmtPx = (v) => {
+  if (v == null) return '—';
+  const a = Math.abs(v);
+  const d = a >= 1000 ? 2 : a >= 1 ? 2 : a >= 0.01 ? 4 : a >= 0.0001 ? 6 : 9;
+  return '$' + v.toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+};
+const fmtPct = (v, d = 2) => (v == null || !isFinite(v) ? '—' : `${v >= 0 ? '+' : ''}${v.toFixed(d)}%`);
+const cls = (v) => (v > 0 ? 'up' : v < 0 ? 'down' : '');
+const fmtN = (v, d = 4) => (v == null ? '—' : Number(v).toLocaleString('en-US', { maximumFractionDigits: d }));
+const fmtTime = (t) => new Date(t).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+const fmtDT = (t) => new Date(t).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+const fmtAge = (h) => (h < 48 ? `${Math.floor(h)}h` : `${Math.floor(h / 24)}d`);
+const short = (a) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : '');
+const mkLabel = (m) => { const [k, s] = String(m).split(':'); return k === 'perp' ? `${s}-PERP` : s; };
+const EXPL = 'https://robinhoodchain.blockscout.com';
+
+async function getJSON(url, opt) {
+  const r = await fetch(url, { credentials: 'same-origin', ...opt });
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(j.error || `Request failed (${r.status})`);
+  return j;
+}
+const postJSON = (url, body, method = 'POST') => getJSON(url, { method, headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}) });
+
+// ------------------------------------------------------------------ toast
+const toastEl = $('#toast');
+let toastTimer;
+function toast(html, ms = 6000) {
+  if (!toastEl) return;
+  toastEl.innerHTML = `<button class="x" aria-label="close">×</button>${html}`;
+  toastEl.classList.add('show');
+  $('.x', toastEl).onclick = () => toastEl.classList.remove('show');
+  clearTimeout(toastTimer);
+  if (ms) toastTimer = setTimeout(() => toastEl.classList.remove('show'), ms);
+}
+
+// ------------------------------------------------------------------ chrome: burger, reveal, ticker
+$('#burger')?.addEventListener('click', () => $('#navlinks').classList.toggle('open'));
+const io = 'IntersectionObserver' in window ? new IntersectionObserver((es) => es.forEach((e) => { if (e.isIntersecting) { e.target.classList.add('in'); io.unobserve(e.target); } }), { threshold: 0.12 }) : null;
+function observe(root = document) { $$('.reveal:not(.in)', root).forEach((el) => (io ? io.observe(el) : el.classList.add('in'))); }
+observe();
+
+async function ticker() {
+  const tr = $('#tickerTrack');
+  if (!tr) return;
+  try {
+    const { rows } = await getJSON('/api/markets?kind=crypto');
+    if (!rows || !rows.length) throw new Error('empty');
+    const items = rows.slice(0, 40).map((r) => `<span><b>${esc(r.symbol)}</b>${fmtPx(r.price)} <em class="${cls(r.change24h)}" style="font-style:normal">${fmtPct(r.change24h)}</em></span>`).join('');
+    tr.innerHTML = items + items;
+  } catch (_) { tr.innerHTML = '<span>Market data is temporarily unavailable.</span>'; }
+}
+ticker(); setInterval(ticker, 60_000);
+
+// ------------------------------------------------------------------ wallet & session
+let viem = null;
+async function V() {
+  if (!viem) viem = await import('https://esm.sh/viem@2.21.55?bundle');
+  return viem;
+}
+let CFG = null, ABI = null;
+async function cfg() { if (!CFG) CFG = await getJSON('/api/config'); return CFG; }
+async function abi() { if (!ABI) ABI = await getJSON('/assets/abi.json'); return ABI; }
+
+const providers = [];
+window.addEventListener('eip6963:announceProvider', (e) => { if (!providers.find((p) => p.info.uuid === e.detail.info.uuid)) providers.push(e.detail); });
+window.dispatchEvent(new Event('eip6963:requestProvider'));
+
+let session = null; // { address, admin }
+let provider = null;
+const LS = { get: (k) => { try { return localStorage.getItem(k); } catch (_) { return null; } }, set: (k, v) => { try { localStorage.setItem(k, v); } catch (_) {} } };
+
+async function loadSession() {
+  try { const s = await getJSON('/api/auth/me'); session = s.address ? s : null; } catch (_) { session = null; }
+  renderLogin();
+  return session;
+}
+function renderLogin() {
+  const b = $('#loginBtn');
+  if (!b) return;
+  if (session) { b.textContent = short(session.address); b.onclick = accountMenu; }
+  else { b.textContent = 'Log in'; b.onclick = () => connect(); }
+}
+function accountMenu() {
+  modal(`<h3>Signed in</h3><p class="hint mono" style="margin-top:6px">${session.address}</p>
+  <div class="wallets"><a class="btn" href="/portfolio/">Portfolio</a>${session.admin ? '<a class="btn" href="/setup/">Setup console</a>' : ''}<button class="btn danger" id="logout">Log out</button></div>`);
+  $('#logout').onclick = async () => { await postJSON('/api/auth/logout'); session = null; closeModal(); location.reload(); };
+}
+
+function modal(html) {
+  closeModal();
+  const m = document.createElement('div');
+  m.className = 'modal';
+  m.id = 'modal';
+  m.innerHTML = `<div class="card">${html}</div>`;
+  m.addEventListener('click', (e) => { if (e.target === m) closeModal(); });
+  document.body.appendChild(m);
+  return m;
+}
+function closeModal() { $('#modal')?.remove(); }
+
+async function pickProvider() {
+  window.dispatchEvent(new Event('eip6963:requestProvider'));
+  await sleep(120);
+  const remembered = LS.get('orla_wallet');
+  if (providers.length === 0) {
+    if (window.ethereum) return window.ethereum;
+    modal(`<h3>No wallet found</h3><p class="hint" style="margin-top:8px">Install a browser wallet such as <a class="up" href="https://rabby.io/" target="_blank">Rabby</a> or <a class="up" href="https://metamask.io/download/" target="_blank">MetaMask</a>, then reload this page.</p>`);
+    throw new Error('no wallet');
+  }
+  if (providers.length === 1) return providers[0].provider;
+  const pre = providers.find((p) => p.info.rdns === remembered);
+  if (pre && provider === pre.provider) return pre.provider;
+  return new Promise((res, rej) => {
+    modal(`<h3>Connect a wallet</h3><p class="hint" style="margin-top:4px">You will sign a message. No transaction, no fee.</p><div class="wallets">${providers.map((p, i) => `<button data-i="${i}"><img src="${p.info.icon}" alt="">${esc(p.info.name)}</button>`).join('')}</div>`);
+    $$('.wallets button').forEach((b) => (b.onclick = () => { const p = providers[+b.dataset.i]; LS.set('orla_wallet', p.info.rdns); closeModal(); res(p.provider); }));
+    $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') rej(new Error('cancelled')); });
+  });
+}
+
+async function connect() {
+  try {
+    provider = await pickProvider();
+    const [address] = await provider.request({ method: 'eth_requestAccounts' });
+    const { getAddress } = await V();
+    const addr = getAddress(address);
+    const { message } = await postJSON('/api/auth/nonce', { address: addr });
+    const signature = await provider.request({ method: 'personal_sign', params: [toHexUtf8(message), addr] });
+    session = await postJSON('/api/auth/verify', { address: addr, message, signature });
+    renderLogin();
+    provider.on?.('accountsChanged', (a) => { if (session && (!a[0] || a[0].toLowerCase() !== session.address.toLowerCase())) { toast('<b>Wallet account changed — please sign in again.</b>'); session = null; renderLogin(); } });
+    document.dispatchEvent(new CustomEvent('orla:session'));
+    return session;
+  } catch (e) {
+    if (e.message !== 'cancelled' && e.message !== 'no wallet') toast(`<b>Could not sign in</b><div class="m">${esc(e.shortMessage || e.message)}</div>`);
+    throw e;
+  }
+}
+const toHexUtf8 = (s) => '0x' + [...new TextEncoder().encode(s)].map((b) => b.toString(16).padStart(2, '0')).join('');
+async function ensureSession() { if (session) return session; return connect(); }
+document.addEventListener('click', (e) => { const b = e.target.closest('[data-connect]'); if (b) { e.preventDefault(); connect().catch(() => {}); } });
+
+// wallet client on Robinhood Chain
+async function wallet() {
+  await ensureSession();
+  if (!provider) provider = await pickProvider();
+  const v = await V();
+  const a = await abi();
+  const chain = v.defineChain({ id: 4663, name: 'Robinhood Chain', nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [a.net.rpc] } }, blockExplorers: { default: { name: 'Blockscout', url: a.net.explorer } }, contracts: { multicall3: { address: '0xcA11bde05977b3631167028862bE2a173976CA11' } } });
+  const hex = '0x' + (4663).toString(16);
+  const cur = await provider.request({ method: 'eth_chainId' });
+  if (cur !== hex) {
+    try { await provider.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: hex }] }); }
+    catch (e) {
+      if (e.code === 4902 || /Unrecognized|not added|unknown/i.test(e.message)) await provider.request({ method: 'wallet_addEthereumChain', params: [{ chainId: hex, chainName: 'Robinhood Chain', nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: [a.net.rpc], blockExplorerUrls: [a.net.explorer] }] });
+      else throw e;
+    }
+  }
+  const [account] = await provider.request({ method: 'eth_requestAccounts' });
+  if (account.toLowerCase() !== session.address.toLowerCase()) throw new Error('Wallet account changed — please sign in again.');
+  const w = v.createWalletClient({ account: v.getAddress(account), chain, transport: v.custom(provider) });
+  const p = v.createPublicClient({ chain, transport: v.http(a.net.rpc) });
+  return { w, p, v, a, chain, account: v.getAddress(account) };
+}
+async function readClient() {
+  const v = await V(); const a = await abi();
+  const chain = v.defineChain({ id: 4663, name: 'Robinhood Chain', nativeCurrency: { name: 'Ether', symbol: 'ETH', decimals: 18 }, rpcUrls: { default: { http: [a.net.rpc] } }, contracts: { multicall3: { address: '0xcA11bde05977b3631167028862bE2a173976CA11' } } });
+  return { p: v.createPublicClient({ chain, transport: v.http(a.net.rpc) }), v, a };
+}
+
+// run a transaction with feedback
+async function tx(label, fn) {
+  toast(`<b><span class="spin"></span> ${esc(label)}</b><div class="m">Confirm in your wallet…</div>`, 0);
+  try {
+    const { w, p } = await wallet();
+    const hash = await fn(w, p);
+    toast(`<b><span class="spin"></span> ${esc(label)}</b><div class="m">Waiting for Robinhood Chain…</div><a href="${EXPL}/tx/${hash}" target="_blank">tx ↗</a>`, 0);
+    const rc = await p.waitForTransactionReceipt({ hash, timeout: 90_000 });
+    if (rc.status !== 'success') throw new Error('Transaction reverted');
+    toast(`<b><i></i>${esc(label)} — done</b><a href="${EXPL}/tx/${hash}" target="_blank">View tx ↗</a>`);
+    return rc;
+  } catch (e) {
+    const msg = e.shortMessage || e.message || String(e);
+    toast(`<b style="color:var(--down)">${esc(label)} failed</b><div class="m">${esc(/insufficient funds/i.test(msg) ? 'insufficient funds for gas — bridge a little ETH to Robinhood Chain.' : msg.slice(0, 160))}</div>`, 9000);
+    throw e;
+  }
+}
+const ERC20 = [
+  { type: 'function', name: 'approve', stateMutability: 'nonpayable', inputs: [{ name: 's', type: 'address' }, { name: 'a', type: 'uint256' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'transfer', stateMutability: 'nonpayable', inputs: [{ name: 't', type: 'address' }, { name: 'a', type: 'uint256' }], outputs: [{ type: 'bool' }] },
+  { type: 'function', name: 'allowance', stateMutability: 'view', inputs: [{ type: 'address' }, { type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'balanceOf', stateMutability: 'view', inputs: [{ type: 'address' }], outputs: [{ type: 'uint256' }] },
+  { type: 'function', name: 'decimals', stateMutability: 'view', inputs: [], outputs: [{ type: 'uint8' }] },
+];
+async function ensureAllowance(token, spender, amount, label = 'Approve') {
+  const { p, account } = await wallet();
+  const cur = await p.readContract({ address: token, abi: ERC20, functionName: 'allowance', args: [account, spender] });
+  if (cur >= amount) return;
+  await tx(label, (w) => w.writeContract({ address: token, abi: ERC20, functionName: 'approve', args: [spender, amount] }));
+}
+
+// ------------------------------------------------------------------ SVG chart
+// series: [{pts:[[t,v]...], color, width, fill}] ; marks: [{t, a, r, p}] ; base: number (dashed line)
+function chart(el, series, { marks = [], base = null, fmt = fmtUsd, xfmt = fmtDT } = {}) {
+  if (!el) return;
+  const all = series.flatMap((s) => s.pts);
+  if (all.length < 2) { el.innerHTML = '<div class="empty">Not enough data yet.</div>'; return; }
+  const W = el.clientWidth || 600, H = el.clientHeight || 200, pl = 4, pr = 4, pt = 10, pb = 22;
+  const t0 = Math.min(...all.map((p) => p[0])), t1 = Math.max(...all.map((p) => p[0]));
+  const vals = all.map((p) => p[1]).concat(base != null ? [base] : []);
+  let mn = Math.min(...vals), mx = Math.max(...vals);
+  const padv = (mx - mn) * 0.08 || 1; mn -= padv; mx += padv;
+  const X = (t) => pl + ((t - t0) / (t1 - t0 || 1)) * (W - pl - pr);
+  const Y = (v) => pt + (1 - (v - mn) / (mx - mn || 1)) * (H - pt - pb);
+  const path = (pts) => pts.map((p, i) => `${i ? 'L' : 'M'}${X(p[0]).toFixed(1)},${Y(p[1]).toFixed(1)}`).join('');
+  const valAt = (pts, t) => { let best = pts[0]; for (const p of pts) { if (p[0] <= t) best = p; else break; } return best[1]; };
+  let svg = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none"><defs><linearGradient id="g${el.id}" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#ffb020" stop-opacity=".28"/><stop offset="1" stop-color="#ffb020" stop-opacity="0"/></linearGradient></defs>`;
+  if (base != null) svg += `<line x1="${pl}" x2="${W - pr}" y1="${Y(base)}" y2="${Y(base)}" stroke="#5f5a50" stroke-dasharray="4 4"/>`;
+  series.forEach((s, i) => {
+    if (s.fill) svg += `<path d="${path(s.pts)}L${X(s.pts[s.pts.length - 1][0])},${H - pb}L${X(s.pts[0][0])},${H - pb}Z" fill="url(#g${el.id})"/>`;
+    svg += `<path d="${path(s.pts)}" fill="none" stroke="${s.color}" stroke-width="${s.width || 1.8}" stroke-linejoin="round" stroke-linecap="round" ${i === 0 ? 'class="draw"' : ''}/>`;
+  });
+  const main = series[0].pts;
+  for (const m of marks) {
+    if (m.t < t0 || m.t > t1) continue;
+    const x = X(m.t), y = Y(valAt(main, m.t));
+    const col = m.a === 'buy' || m.a === 'cover' ? '#3ccf86' : m.a === 'short' ? '#ff6b5a' : '#f3efe6';
+    const shape = m.a === 'buy' ? `<path d="M${x},${y - 7} l5,8 h-10z" fill="${col}"/>` : m.a === 'short' ? `<path d="M${x},${y + 7} l5,-8 h-10z" fill="${col}"/>` : `<circle cx="${x}" cy="${y}" r="3.6" fill="${col}"/>`;
+    svg += `<g class="mk" data-tip="${esc(`${m.a.toUpperCase()} ${m.p ? fmtPx(m.p) : ''} · ${m.r || ''} · ${xfmt(m.t)}`)}" data-x="${x}" data-y="${y}">${shape}<circle cx="${x}" cy="${y}" r="9" fill="transparent"/></g>`;
+  }
+  const ticks = [t0, (t0 + t1) / 2, t1];
+  svg += ticks.map((t, i) => `<text x="${X(t)}" y="${H - 5}" fill="#8f897c" font-size="10" font-family="JetBrains Mono" text-anchor="${i === 0 ? 'start' : i === 2 ? 'end' : 'middle'}">${xfmt(t)}</text>`).join('');
+  svg += `<line class="hair" x1="0" x2="0" y1="${pt}" y2="${H - pb}" stroke="#3a362f" opacity="0"/></svg><div class="tip"></div>`;
+  el.innerHTML = svg;
+  const tip = $('.tip', el), hair = $('.hair', el), s = $('svg', el);
+  $$('.mk', el).forEach((g) => {
+    g.addEventListener('mouseenter', () => { tip.textContent = g.dataset.tip; tip.style.left = (g.dataset.x / W) * 100 + '%'; tip.style.top = (g.dataset.y / H) * 100 + '%'; tip.style.opacity = 1; });
+    g.addEventListener('mouseleave', () => (tip.style.opacity = 0));
+  });
+  s.addEventListener('mousemove', (e) => {
+    if (e.target.closest('.mk')) return;
+    const r = s.getBoundingClientRect();
+    const x = ((e.clientX - r.left) / r.width) * W;
+    const t = t0 + ((x - pl) / (W - pl - pr)) * (t1 - t0);
+    hair.setAttribute('x1', x); hair.setAttribute('x2', x); hair.setAttribute('opacity', 1);
+    tip.innerHTML = series.map((sr) => `<span style="color:${sr.color}">${fmt(valAt(sr.pts, t))}</span>`).join(' · ') + ` <span class="muted">${xfmt(t)}</span>`;
+    tip.style.left = (x / W) * 100 + '%'; tip.style.top = '12%'; tip.style.opacity = 1;
+  });
+  s.addEventListener('mouseleave', () => { hair.setAttribute('opacity', 0); tip.style.opacity = 0; });
+  const d = $('.draw', el);
+  if (d && d.getTotalLength) { const L = d.getTotalLength(); d.style.strokeDasharray = L; d.style.strokeDashoffset = L; d.getBoundingClientRect(); d.style.transition = 'stroke-dashoffset 1.2s ease'; d.style.strokeDashoffset = 0; }
+}
+
+// ------------------------------------------------------------------ stats (home + leaderboard)
+async function loadStats() {
+  try {
+    const s = await getJSON('/api/stats');
+    const set = (id, v) => { const el = $(id); if (el) countUp(el, v); };
+    set('#kAgents', s.agents); set('#kDecisions', s.decisions); set('#kTrades', s.trades);
+  } catch (_) {}
+}
+function countUp(el, to) {
+  const from = Number(el.dataset.v || 0); el.dataset.v = to;
+  const t0 = performance.now();
+  const tick = (now) => { const k = Math.min(1, (now - t0) / 900); el.textContent = Math.round(from + (to - from) * (1 - (1 - k) ** 3)).toLocaleString('en-US'); if (k < 1) requestAnimationFrame(tick); };
+  requestAnimationFrame(tick);
+}
+
+// ================================================================== PAGES
+const pages = {};
+
+// ------------------------------------------------------------------ home
+pages.home = async () => {
+  loadStats();
+  const drawLive = async () => {
+    try {
+      const { agent } = await getJSON('/api/agents/top');
+      if (!agent) return;
+      $('#liveName').textContent = `Top agent / ${agent.name}`;
+      $('#livePnl').textContent = fmtUsd(agent.equity);
+      $('#liveRet').innerHTML = `<span class="${cls(agent.returnPct)}">${fmtPct(agent.returnPct)}</span>`;
+      $('#liveLog').innerHTML = agent.decisions.length ? agent.decisions.map((d, i) => `<div class="row" style="animation-delay:${i * 80}ms"><span class="t">${fmtTime(d.at)}</span><span class="tag ${d.action}">${d.action}</span><span>${esc(mkLabel(agent.market))} — ${esc(d.reason)}</span></div>`).join('') : '<div class="empty">Waiting for the first decision.</div>';
+      $('#liveConsole').onclick = () => (location.href = `/agent/?id=${agent.id}`);
+      $('#liveConsole').style.cursor = 'pointer';
+    } catch (_) {}
+  };
+  drawLive(); setInterval(drawLive, 60_000);
+  $('#notify')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    try { await postJSON('/api/newsletter', { email: e.target.email.value }); $('#notifyMsg').textContent = 'Thanks — you are on the list.'; e.target.reset(); }
+    catch (er) { $('#notifyMsg').textContent = er.message; }
+  });
+  // pool swap toast + live fee tag
+  try {
+    const ps = await getJSON('/api/pools/stats');
+    if (ps.enabled && ps.fee) $('#tagFee').textContent = ps.fee.total.toFixed(2) + '%';
+    const s = ps.latest?.[0];
+    if (s && Date.now() - s.at < 6 * 3600_000) {
+      setTimeout(() => toast(`<b><i></i>New swap in the ORLA hooked pool</b><div class="m">WETH / USDG · ${fmtUsd(s.usd)} · hook fee ${(s.fee / 1e4).toFixed(2)}% · ${Math.max(1, Math.round((Date.now() - s.at) / 60000))}m ago</div><a href="/pools/">See the pool →</a> &nbsp; <a href="${EXPL}/tx/${s.tx}" target="_blank">tx ↗</a>`, 9000), 2500);
+    }
+  } catch (_) {}
+};
+
+// ------------------------------------------------------------------ markets
+pages.markets = async () => {
+  let kind = new URLSearchParams(location.search).get('kind') || 'crypto';
+  let prev = {};
+  const draw = async (first) => {
+    try {
+      const { rows } = await getJSON(`/api/markets?kind=${kind}`);
+      const g = $('#mGrid');
+      if (!rows.length) { g.innerHTML = '<div class="empty" style="grid-column:1/-1">This market source is not responding right now. Try again in a minute.</div>'; return; }
+      g.innerHTML = rows.map((r) => {
+        const id = `${kind}:${r.symbol}`;
+        const changed = prev[r.symbol] != null && prev[r.symbol] !== r.price;
+        return `<a class="card mkt ${changed ? 'flash' : ''}" href="/agents/?market=${encodeURIComponent(id)}"><div class="s"><i>${esc(r.symbol.slice(0, 3))}</i>${esc(kind === 'perp' ? r.symbol + '-PERP' : r.symbol)}</div><div class="p">${fmtPx(r.price)}</div><div class="c ${cls(r.change24h)}">${r.change24h >= 0 ? '▲' : '▼'} ${Math.abs(r.change24h).toFixed(2)}% 24h${kind === 'perp' && r.funding != null ? ` <span class="muted">· f ${(r.funding).toFixed(4)}%</span>` : ''}</div><span class="b">Build agent →</span></a>`;
+      }).join('');
+      prev = Object.fromEntries(rows.map((r) => [r.symbol, r.price]));
+      if (first) observe(g);
+    } catch (e) { $('#mGrid').innerHTML = `<div class="empty" style="grid-column:1/-1">${esc(e.message)}</div>`; }
+  };
+  $$('#mTabs .chip').forEach((b) => {
+    b.classList.toggle('on', b.dataset.k === kind);
+    b.onclick = () => { kind = b.dataset.k; prev = {}; $$('#mTabs .chip').forEach((x) => x.classList.toggle('on', x === b)); $('#mGrid').innerHTML = '<div class="card mkt skel" style="height:86px"></div>'.repeat(10); draw(true); history.replaceState(null, '', `?kind=${kind}`); };
+  });
+  draw(true); setInterval(() => draw(false), 20_000);
+};
+
+// ------------------------------------------------------------------ agent studio
+pages.agents = async () => {
+  const qs = new URLSearchParams(location.search);
+  const [{ strategies }, catalog] = await Promise.all([getJSON('/api/strategies'), getJSON('/api/catalog')]);
+  let holder = false;
+  const fS = $('#fStrategy'), fM = $('#fMarket'), fMode = $('#fMode');
+  fS.innerHTML = Object.entries(strategies).map(([k, s]) => `<option value="${k}">${s.label}</option>`).join('');
+  const marketOpts = (mode) => {
+    const groups = mode === 'live' ? [['Live vault markets', catalog.live.map((id) => { const [k, s] = id.split(':'); const e = catalog[k].find((x) => x.sym === s); return [id, `${s} · ${e?.name || s}`]; })]]
+      : mode.startsWith('hl') ? [['Perpetuals', catalog.perp.map((x) => [`perp:${x.sym}`, `${x.sym}-PERP · ${x.name}`])]]
+      : [['Crypto', catalog.crypto.map((x) => [`crypto:${x.sym}`, `${x.sym}${x.name !== x.sym ? ' · ' + x.name : ''}`])], ['Perpetuals', catalog.perp.map((x) => [`perp:${x.sym}`, `${x.sym}-PERP${x.name !== x.sym ? ' · ' + x.name : ''}`])], ['Stocks & ETFs', catalog.stock.map((x) => [`stock:${x.sym}`, `${x.sym}${x.name !== x.sym ? ' · ' + x.name : ''}`])]];
+    const cur = fM.value;
+    fM.innerHTML = groups.map(([g, opts]) => `<optgroup label="${g}">${opts.map(([v, t]) => `<option value="${v}">${esc(t)}</option>`).join('')}</optgroup>`).join('');
+    if ([...fM.options].some((o) => o.value === cur)) fM.value = cur;
+  };
+  marketOpts('paper');
+  fM.value = 'crypto:BTC';
+
+  const paramsUI = () => {
+    const s = strategies[fS.value];
+    $('#fBlurb').textContent = s.blurb;
+    $('#fParams').innerHTML = Object.entries(s.params).map(([k, [d, lo, hi, label]]) => `<div><label class="f">${label}</label><input class="inp" type="number" data-p="${k}" value="${d}" min="${lo}" max="${hi}" step="${k === 'sigma' || k === 'depth' ? 0.1 : 1}"></div>`).join('');
+    $$('#fParams input').forEach((i) => i.addEventListener('input', schedule));
+  };
+  const readParams = () => {
+    const p = {};
+    $$('#fParams input').forEach((i) => (p[i.dataset.p] = Number(i.value)));
+    for (const k of ['StopLoss', 'TakeProfit', 'MaxLoss24h', 'PositionPct']) p[k[0].toLowerCase() + k.slice(1)] = Number($('#p' + k).value);
+    p.side = $('#fSide').value; p.leverage = Number($('#fLev').value);
+    return p;
+  };
+  const setParams = (p) => {
+    for (const [k, v] of Object.entries(p)) {
+      const i = $(`#fParams [data-p="${k}"]`); if (i) i.value = v;
+      const j = $('#p' + k[0].toUpperCase() + k.slice(1)); if (j) j.value = v;
+    }
+    if (p.side) $('#fSide').value = p.side;
+    if (p.leverage) $('#fLev').value = String(p.leverage);
+  };
+  const kindOf = () => fM.value.split(':')[0];
+  const syncPerp = () => { $('#perpBox').classList.toggle('hide', kindOf() !== 'perp' || fMode.value === 'live'); };
+
+  // regime hint
+  const regime = async () => {
+    const r = $('#regime');
+    r.innerHTML = '<span class="skel">Reading the last 7 days…</span>';
+    try {
+      const g = await getJSON(`/api/regime?market=${encodeURIComponent(fM.value)}`);
+      if (!g) { r.innerHTML = '<p>Not enough recent data.</p>'; return; }
+      const fit = g.trend === 'up' ? ['Momentum', 'Buy the dip in an uptrend'] : g.trend === 'down' ? ['RSI reversal', 'Momentum'] : ['Mean reversion', 'RSI reversal'];
+      const note = g.trend === 'up' ? 'Trend-following strategies have room to work. Dip buying needs the trend to hold.' : g.trend === 'down' ? 'Long-only agents mostly sit in cash in a downtrend. RSI reversal trades short bounces, so use a stop loss. Momentum waits for a breakout and sits out the drop.' : 'Range-bound prices suit strategies that buy stretches and sell the average.';
+      r.innerHTML = `<span class="muted">Last 7 days</span> <b class="${g.trend === 'up' ? 'up' : g.trend === 'down' ? 'down' : ''}">${g.trend === 'up' ? 'Uptrend' : g.trend === 'down' ? 'Downtrend' : 'Sideways'}</b> <span class="mono muted">${fmtPct(g.changePct)} · ${g.vol} volatility</span><div class="chips">${fit.map((f) => `<span class="chip">${f}</span>`).join('')}</div><p>${note} A description of recent prices, not a forecast.</p>`;
+    } catch (_) { r.innerHTML = '<p>Market description unavailable right now.</p>'; }
+  };
+
+  // local backtest (runs in the browser)
+  const barsCache = {};
+  const loadBars = async (market, hours) => {
+    const key = market + ':' + hours;
+    if (!barsCache[key]) barsCache[key] = getJSON(`/api/candles?market=${encodeURIComponent(market)}&hours=${hours}`).then((r) => r.bars);
+    return barsCache[key];
+  };
+  let lastBt = null;
+  const runBt = async () => {
+    const win = Number($('#fWindow').value);
+    if (win > 720 && !holder) { $('#btMetrics').innerHTML = '<div class="hint" style="grid-column:1/-1">90 and 180-day backtests are for $ORLA holders (1,000,000+).</div>'; $('#btChart').innerHTML = ''; return; }
+    const strat = fS.value;
+    const p = E.sanitize(strat, readParams(), kindOf());
+    $('#btTitle').textContent = `Backtest · last ${win / 24} days`;
+    $('#btChart').innerHTML = '<div class="empty"><span class="spin"></span></div>';
+    try {
+      const bars = await loadBars(fM.value, win + E.lookback(strat, p) + 4);
+      const r = E.backtest(strat, p, bars, win);
+      lastBt = r;
+      if (!r) throw new Error('Not enough price history for this market.');
+      chart($('#btChart'), [{ pts: r.curve, color: '#ffb020', width: 2, fill: true }, { pts: r.hold, color: '#8f897c', width: 1.4 }], { marks: r.marks, base: 10000 });
+      const M = [['Return', fmtPct(r.returnPct), cls(r.returnPct)], ['Just holding', fmtPct(r.holdPct), cls(r.holdPct)], ['vs hold', fmtPct(r.vsHoldPct), cls(r.vsHoldPct)], ['Max drawdown', r.maxDrawdownPct.toFixed(1) + '%', ''], ['Win rate', r.winRatePct.toFixed(0) + '%', ''], ['Trades', r.trades, ''], ['Sharpe', r.sharpe.toFixed(2), ''], ['Avg hold', r.avgHoldHours >= 48 ? (r.avgHoldHours / 24).toFixed(1) + 'd' : r.avgHoldHours.toFixed(1) + 'h', ''], ['Profit factor', r.profitFactor.toFixed(2), ''], ['Best trade', fmtPct(r.bestTradePct), cls(r.bestTradePct)], ['Worst trade', fmtPct(r.worstTradePct), cls(r.worstTradePct)], ['Time in market', r.timeInMarketPct.toFixed(0) + '%', '']];
+      if (kindOf() === 'perp') M.push(['Funding', fmtUsd(-r.fundingPaid), cls(-r.fundingPaid)]);
+      $('#btMetrics').innerHTML = M.map(([l, v, c]) => `<div><div class="l">${l}</div><div class="v ${c}">${v}</div></div>`).join('');
+    } catch (e) { $('#btChart').innerHTML = `<div class="empty">${esc(e.message)}</div>`; $('#btMetrics').innerHTML = ''; }
+  };
+  let tmr;
+  function schedule() { clearTimeout(tmr); tmr = setTimeout(runBt, 350); }
+
+  // optimizer & comparison (browser-side)
+  $('#optBtn').onclick = async () => {
+    const out = $('#optOut');
+    out.innerHTML = '<div class="bt"><span class="spin"></span> Searching settings on the first two-thirds of the window…</div>';
+    await sleep(30);
+    const win = Math.min(Number($('#fWindow').value), holder ? 4320 : 720);
+    const strat = fS.value, base = readParams();
+    const bars = await loadBars(fM.value, win + 410);
+    const fitH = Math.floor(win * 2 / 3), testH = win - fitH;
+    const fitBars = bars.slice(0, bars.length - testH);
+    let best = null;
+    for (const g of E.grid(strat)) {
+      const p = E.sanitize(strat, { ...base, ...g }, kindOf());
+      const r = E.backtest(strat, p, fitBars, fitH);
+      if (!r) continue;
+      const score = r.returnPct - Math.abs(Math.min(0, r.maxDrawdownPct)) * 0.3 + (r.trades ? 0 : -5);
+      if (!best || score > best.score) best = { score, g, fit: r };
+    }
+    if (!best) { out.innerHTML = '<div class="bt">Not enough data.</div>'; return; }
+    const test = E.backtest(strat, E.sanitize(strat, { ...base, ...best.g }, kindOf()), bars, testH);
+    out.innerHTML = `<div class="bt"><div class="bt-top"><span class="kicker">Best settings</span><button class="btn sm primary" id="useBest">Use these</button></div>
+    <p class="mono" style="margin:8px 0;font-size:12.5px">${Object.entries(best.g).map(([k, v]) => `${k} ${v}`).join(' · ')}</p>
+    <div class="metrics"><div><div class="l">Fit (first ${Math.round(fitH / 24)}d)</div><div class="v ${cls(best.fit.returnPct)}">${fmtPct(best.fit.returnPct)}</div></div><div><div class="l">Unseen (last ${Math.round(testH / 24)}d)</div><div class="v ${cls(test?.returnPct)}">${fmtPct(test?.returnPct)}</div></div><div><div class="l">Hold (unseen)</div><div class="v ${cls(test?.holdPct)}">${fmtPct(test?.holdPct)}</div></div></div>
+    <p class="note">Settings were chosen on the first part only. The unseen result is the honest one: if it is much worse, the fit was luck.</p></div>`;
+    $('#useBest').onclick = () => { setParams(best.g); runBt(); out.innerHTML = ''; };
+  };
+  $('#cmpBtn').onclick = async () => {
+    const out = $('#optOut');
+    out.innerHTML = '<div class="bt"><span class="spin"></span> Comparing every strategy…</div>';
+    await sleep(30);
+    const win = Math.min(Number($('#fWindow').value), holder ? 4320 : 720);
+    const bars = await loadBars(fM.value, win + 410);
+    const base = readParams();
+    const rows = Object.keys(strategies).map((s) => {
+      const def = Object.fromEntries(Object.entries(strategies[s].params).map(([k, v]) => [k, v[0]]));
+      const r = E.backtest(s, E.sanitize(s, { ...base, ...def }, kindOf()), bars, win);
+      return { s, r };
+    }).filter((x) => x.r).sort((a, b) => b.r.returnPct - a.r.returnPct);
+    out.innerHTML = `<div class="bt"><div class="bt-top"><span class="kicker">Strategies on ${esc(mkLabel(fM.value))} · ${win / 24}d</span></div>${rows.map((x, i) => `<div class="trow" style="grid-template-columns:24px 1fr 80px 80px 60px"><span class="muted">${i + 1}</span><span>${strategies[x.s].label}</span><span class="${cls(x.r.returnPct)}">${fmtPct(x.r.returnPct)}</span><span class="muted">${x.r.trades} trades</span><button class="btn sm" data-s="${x.s}">Use</button></div>`).join('')}</div>`;
+    $$('#optOut [data-s]').forEach((b) => (b.onclick = () => { fS.value = b.dataset.s; paramsUI(); runBt(); out.innerHTML = ''; }));
+  };
+
+  // mode switching
+  const modeUI = async () => {
+    const m = fMode.value;
+    marketOpts(m.startsWith('hl') ? 'hl' : m);
+    if (m === 'live' && !catalog.live.includes(fM.value)) fM.value = 'crypto:ETH';
+    if (m.startsWith('hl') && kindOf() !== 'perp') fM.value = 'perp:BTC';
+    syncPerp();
+    $('#launchNote').textContent = m === 'paper' ? 'Paper mode · $10,000 virtual cash · connecting a wallet only signs a message' : m === 'live' ? 'Live mode · trades the USDG in your vault · long-only, 1x' : 'Hyperliquid · trades perps in your own account through an approved agent wallet';
+    $('#hlBox').innerHTML = '';
+    if (m.startsWith('hl')) hlBox(m.split('-')[1]);
+    regime(); schedule(); launchLabel();
+  };
+  const hlBox = async (network) => {
+    const box = $('#hlBox');
+    if (!session) { box.innerHTML = `<div class="callout" style="margin-top:10px"><span>Sign in, then approve an agent wallet on Hyperliquid ${network}.</span><a href="#" data-connect>Connect →</a></div>`; return; }
+    box.innerHTML = '<div class="callout" style="margin-top:10px"><span class="spin"></span></div>';
+    try {
+      const st = await getJSON(`/api/me/hl?network=${network}`);
+      if (st.status === 'connected') {
+        box.innerHTML = `<div class="callout" style="margin-top:10px"><span>Hyperliquid ${network} connected · agent ${short(st.agentAddress)}${st.account ? ` · account ${fmtUsd(st.account.accountValue)}` : ''}</span><a href="#" id="hlForget">Disconnect</a></div>`;
+        $('#hlForget').onclick = async (e) => { e.preventDefault(); await postJSON('/api/me/hl/forget', { network }); hlBox(network); };
+        return;
+      }
+      box.innerHTML = `<div class="callout" style="margin-top:10px;flex-direction:column;align-items:flex-start"><span>Approve agent wallet <b class="mono">${short(st.agentAddress)}</b> on Hyperliquid ${network}. It can place and close orders; it can never withdraw.</span><button class="btn sm primary" id="hlApprove">Approve on Hyperliquid</button></div>`;
+      $('#hlApprove').onclick = async () => {
+        try {
+          if (!provider) provider = await pickProvider();
+          const chainHex = await provider.request({ method: 'eth_chainId' });
+          const nonce = Date.now();
+          const action = { type: 'approveAgent', signatureChainId: chainHex, hyperliquidChain: network === 'mainnet' ? 'Mainnet' : 'Testnet', agentAddress: st.agentAddress, agentName: 'ORLA', nonce };
+          const typed = { domain: { name: 'HyperliquidSignTransaction', version: '1', chainId: parseInt(chainHex, 16), verifyingContract: '0x0000000000000000000000000000000000000000' },
+            types: { EIP712Domain: [{ name: 'name', type: 'string' }, { name: 'version', type: 'string' }, { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' }], 'HyperliquidTransaction:ApproveAgent': [{ name: 'hyperliquidChain', type: 'string' }, { name: 'agentAddress', type: 'address' }, { name: 'agentName', type: 'string' }, { name: 'nonce', type: 'uint64' }] },
+            primaryType: 'HyperliquidTransaction:ApproveAgent', message: { hyperliquidChain: action.hyperliquidChain, agentAddress: action.agentAddress, agentName: 'ORLA', nonce } };
+          const sig = await provider.request({ method: 'eth_signTypedData_v4', params: [session.address, JSON.stringify(typed)] });
+          const signature = { r: '0x' + sig.slice(2, 66), s: '0x' + sig.slice(66, 130), v: parseInt(sig.slice(130, 132), 16) };
+          await postJSON('/api/me/hl', { network, action, nonce, signature });
+          toast('<b><i></i>Hyperliquid connected</b>');
+          hlBox(network);
+        } catch (e) { toast(`<b style="color:var(--down)">Approval failed</b><div class="m">${esc(e.shortMessage || e.message)}</div>`); }
+      };
+    } catch (e) { box.innerHTML = `<div class="callout" style="margin-top:10px"><span>${esc(e.message)}</span></div>`; }
+  };
+
+  const launchLabel = () => { $('#launchBtn').textContent = session ? 'Backtest & launch' : 'Connect wallet to launch'; };
+  $('#launchBtn').onclick = async () => {
+    $('#launchErr').textContent = '';
+    try {
+      await ensureSession();
+      launchLabel();
+      const mode = fMode.value;
+      const body = { name: $('#fName').value.trim(), strategy: fS.value, market: fM.value, mode: mode.startsWith('hl') ? 'hl' : mode, hlNetwork: mode.startsWith('hl') ? mode.split('-')[1] : undefined, params: readParams(), sourceId: qs.get('copy') || undefined };
+      if (!body.name) { $('#launchErr').textContent = 'Give your agent a name.'; $('#fName').focus(); return; }
+      $('#launchBtn').disabled = true; $('#launchBtn').innerHTML = '<span class="spin"></span> Backtesting & launching…';
+      const { agent } = await postJSON('/api/me/agents', body);
+      toast(`<b><i></i>${esc(agent.name)} is live</b><div class="m">${agent.mode === 'paper' ? 'Paper mode' : 'Live'} · first decision logged</div><a href="/agent/?id=${agent.id}">Open its page →</a>`);
+      location.href = `/agent/?id=${agent.id}`;
+    } catch (e) { if (e.message !== 'cancelled') $('#launchErr').textContent = e.message; }
+    finally { $('#launchBtn').disabled = false; launchLabel(); }
+  };
+
+  $('#exampleBtn').onclick = () => {
+    fMode.value = 'paper'; modeUI(); fS.value = 'momentum'; paramsUI(); fM.value = 'crypto:BTC';
+    setParams({ positionPct: 50, stopLoss: 8, maxLoss24h: 5 }); if (!$('#fName').value) $('#fName').value = 'First Light';
+    regime(); runBt(); $('#studio').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  };
+  $('#riskToggle').onclick = () => { const b = $('#riskBox'); b.classList.toggle('hide'); $('#riskToggle').textContent = (b.classList.contains('hide') ? '▸' : '▾') + ' Risk controls · 0 = off'; };
+
+  fS.onchange = () => { paramsUI(); schedule(); };
+  fM.onchange = () => { syncPerp(); regime(); schedule(); };
+  fMode.onchange = modeUI;
+  $('#fWindow').onchange = schedule;
+  ['#fSide', '#fLev', '#pStopLoss', '#pTakeProfit', '#pMaxLoss24h', '#pPositionPct'].forEach((s) => $(s).addEventListener('input', schedule));
+
+  paramsUI();
+  // deep links: ?market=… or ?copy=<agentId>
+  if (qs.get('market') && [...fM.options].some((o) => o.value === qs.get('market'))) fM.value = qs.get('market');
+  if (qs.get('copy')) {
+    try {
+      const { agent } = await getJSON(`/api/agents/${qs.get('copy')}`);
+      fS.value = agent.strategy; paramsUI(); fM.value = agent.market; setParams(agent.params);
+      $('#fName').value = (agent.name + ' copy').slice(0, 32);
+      toast(`<b>Setup copied from ${esc(agent.name)}</b><div class="m">Backtest it, then launch your own.</div>`);
+    } catch (_) {}
+  }
+  if (qs.get('mode') === 'live') { const keep = fM.value; fMode.value = 'live'; await modeUI(); if (catalog.live.includes(keep)) fM.value = keep; $('#fName').value = ($('#fName').value.replace(/ copy$/, '') + ' live').slice(0, 32); }
+  syncPerp(); regime(); runBt();
+
+  // signed-in parts: holder, my agents, vault
+  const signedIn = async () => {
+    launchLabel();
+    if (!session) return;
+    try { holder = (await getJSON('/api/me/holder')).holder; } catch (_) {}
+    myAgents(); vaultCard();
+    if (fMode.value.startsWith('hl')) hlBox(fMode.value.split('-')[1]);
+  };
+  document.addEventListener('orla:session', signedIn);
+  await loadSession();
+  signedIn();
+};
+
+async function myAgents() {
+  const box = $('#myAgents');
+  try {
+    const { agents, max } = await getJSON('/api/me/agents');
+    if (!agents.length) { box.innerHTML = ''; return; }
+    box.innerHTML = `<div class="head" style="padding:10px 0 0"><h3>Your agents · ${agents.length}/${max}</h3></div><div class="myagents">${agents.map((a) => `<a class="card myagent" href="/agent/?id=${a.id}"><div><b>${esc(a.name)}</b> <span class="tag ${a.mode === 'paper' ? '' : 'accent'}">${a.mode === 'hl' ? 'HL ' + a.hlNetwork : a.mode}</span> ${a.status === 'paused' ? '<span class="tag">paused</span>' : ''}<div class="hint" style="margin-top:2px">${esc(a.strategyLabel)} · ${esc(a.marketLabel)} · ${a.trades} trades${a.error ? ` · <span class="down">${esc(a.error)}</span>` : ''}</div></div><div class="mono">${fmtUsd(a.equity)}</div><div class="mono ${cls(a.returnPct)}">${fmtPct(a.returnPct)}</div></a>`).join('')}</div>`;
+  } catch (_) {}
+}
+
+async function vaultCard() {
+  const box = $('#vaultCard');
+  if (!box) return;
+  let v;
+  try { v = await getJSON('/api/me/vault'); } catch (e) { box.innerHTML = `<div class="card vaultcard"><h3>Live trading vault</h3><p class="hint">${esc(e.message)}</p></div>`; return; }
+  if (!v.enabled) { box.innerHTML = `<div class="card vaultcard"><h3>Live trading vault</h3><p class="hint">Live trading is being set up. Paper agents work today.</p></div>`; return; }
+  const a = await abi();
+  if (!v.vault) {
+    box.innerHTML = `<div class="card vaultcard"><div style="display:flex;justify-content:space-between;align-items:center"><h3>Live trading vault</h3><span class="tag">not created</span></div>
+    <p class="hint">A vault contract owned by your wallet. Agents swap inside it; only you can withdraw.</p>
+    <div class="row2"><div><label class="f">Daily trading limit (USD)</label><input class="inp" id="vLimit" type="number" value="500" min="1"></div><div><label class="f">Max slippage vs oracle (%)</label><input class="inp" id="vSlip" type="number" value="1" min="0.1" max="5" step="0.1"></div></div>
+    <button class="btn primary" id="vCreate" style="margin-top:14px">Create vault</button></div>`;
+    $('#vCreate').onclick = async () => {
+      const lim = Number($('#vLimit').value), slip = Math.round(Number($('#vSlip').value) * 100);
+      const { v: vi } = await wallet();
+      await tx('Create vault', (w) => w.writeContract({ address: v.factory, abi: a.abi.AgentVaultFactory, functionName: 'createVault', args: [slip, vi.parseUnits(String(lim), 18)] }));
+      vaultCard();
+    };
+    return;
+  }
+  const usdg = v.balances.find((b) => b.symbol === 'USDG');
+  box.innerHTML = `<div class="card vaultcard"><div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap"><h3>Live trading vault</h3><div class="chips">${v.paused ? '<span class="tag red">paused</span>' : '<span class="tag green">active</span>'}${v.agentAccess ? '<span class="tag accent">agent access on</span>' : '<span class="tag">agent access off</span>'}<a class="tag" href="${EXPL}/address/${v.vault}" target="_blank">${short(v.vault)} ↗</a></div></div>
+  <div class="bal">${v.balances.filter((b) => b.amount > 0 || b.symbol === 'USDG').map((b) => `<div><small>${b.symbol}</small><b>${fmtN(b.amount, b.symbol === 'USDG' ? 2 : 6)}</b><small>${fmtUsd(b.usd)}</small></div>`).join('')}<div><small>Total</small><b>${fmtUsd(v.totalUsd)}</b><small>daily left ${fmtUsd(v.remainingDailyUsd, 0)} / ${fmtUsd(v.dailyLimitUsd, 0)}</small></div></div>
+  <div class="row2" style="margin-top:12px"><div><label class="f">Deposit USDG</label><div style="display:flex;gap:8px"><input class="inp" id="vDep" type="number" placeholder="25"><button class="btn" id="vDepBtn">Deposit</button></div></div>
+  <div><label class="f">Withdraw</label><div style="display:flex;gap:8px"><select class="inp" id="vWTok" style="max-width:110px">${v.balances.filter((b) => b.amount > 0 || b.symbol === 'USDG').map((b) => `<option value="${b.symbol}">${b.symbol}</option>`).join('')}</select><input class="inp" id="vW" placeholder="amount or max"><button class="btn" id="vWBtn">Withdraw</button></div></div></div>
+  <div class="chips" style="margin-top:12px"><button class="btn sm" id="vPause">${v.paused ? 'Resume vault' : 'Pause vault'}</button><button class="btn sm" id="vAccess">${v.agentAccess ? 'Revoke agent access' : 'Give agent access'}</button><button class="btn sm" id="vLimits">Change limits</button></div></div>`;
+  const VA = a.abi.AgentVault;
+  $('#vDepBtn').onclick = async () => { const { v: vi } = await wallet(); await tx('Deposit USDG', (w) => w.writeContract({ address: usdg.address, abi: ERC20, functionName: 'transfer', args: [v.vault, vi.parseUnits($('#vDep').value || '0', 6)] })); vaultCard(); };
+  $('#vWBtn').onclick = async () => {
+    const b = v.balances.find((x) => x.symbol === $('#vWTok').value);
+    const { v: vi, account } = await wallet();
+    const amt = /max/i.test($('#vW').value) ? BigInt(b.raw) : vi.parseUnits($('#vW').value || '0', b.decimals);
+    await tx(`Withdraw ${b.symbol}`, (w) => w.writeContract({ address: v.vault, abi: VA, functionName: 'withdraw', args: [b.address, amt, account] })); vaultCard();
+  };
+  $('#vPause').onclick = async () => { await tx(v.paused ? 'Resume vault' : 'Pause vault', (w) => w.writeContract({ address: v.vault, abi: VA, functionName: 'setPaused', args: [!v.paused] })); vaultCard(); };
+  $('#vAccess').onclick = async () => {
+    const op = v.agentAccess ? '0x0000000000000000000000000000000000000000' : v.botAddress;
+    if (!op) return toast('<b>Bot address unavailable.</b>');
+    await tx(v.agentAccess ? 'Revoke agent access' : 'Give agent access', (w) => w.writeContract({ address: v.vault, abi: VA, functionName: 'setOperator', args: [op] })); vaultCard();
+  };
+  $('#vLimits').onclick = () => {
+    modal(`<h3>Vault limits</h3><label class="f">Daily trading limit (USD)</label><input class="inp" id="mL" type="number" value="${Math.round(v.dailyLimitUsd)}"><label class="f">Max slippage vs oracle (%)</label><input class="inp" id="mS" type="number" step="0.1" value="${v.maxSlippageBps / 100}"><button class="btn primary block" id="mGo" style="margin-top:14px">Save limits</button>`);
+    $('#mGo').onclick = async () => { const { v: vi } = await wallet(); const L = $('#mL').value, S = Math.round(Number($('#mS').value) * 100); closeModal(); await tx('Change limits', (w) => w.writeContract({ address: v.vault, abi: VA, functionName: 'setLimits', args: [S, vi.parseUnits(String(L), 18)] })); vaultCard(); };
+  };
+}
+
+// ------------------------------------------------------------------ agent page
+pages.agent = async () => {
+  const id = new URLSearchParams(location.search).get('id');
+  if (!id) { $('#aName').textContent = 'No agent selected'; return; }
+  let a, range = 0, showAll = false;
+  const draw = () => {
+    const now = Date.now();
+    const pts = a.curve.filter((x) => !range || x[0] >= now - range * 3600_000);
+    const marks = a.decisions.filter((d) => !['hold', 'launch', 'edit'].includes(d.action)).map((d) => ({ t: d.at, a: d.action, p: d.price, r: d.reason }));
+    chart($('#aChart'), [{ pts: pts.map((x) => [x[0], x[1]]), color: '#ffb020', width: 2, fill: true }, { pts: pts.map((x) => [x[0], x[2]]), color: '#8f897c' }], { marks, base: a.startCash });
+  };
+  const load = async () => {
+    ({ agent: a } = await getJSON(`/api/agents/${id}`));
+    document.title = `${a.name} · ${a.marketLabel} · ORLA`;
+    $('#aName').textContent = a.name;
+    $('#aMeta').innerHTML = `<span class="tag ${a.mode === 'paper' ? '' : 'accent'}">${a.mode === 'hl' ? 'Hyperliquid ' + a.hlNetwork : a.mode}</span><span class="tag ${a.status === 'active' ? 'green' : ''}">● ${a.status === 'active' ? 'running' : a.status}</span><span>${esc(a.strategyLabel)} · ${esc(a.marketLabel)}${a.side === 'short' ? ' · short' : ''}${a.leverage > 1 ? ` · ${a.leverage}x` : ''} · by ${esc(a.owner)} · running ${fmtAge(a.ageHours)}</span>`;
+    const vs = a.returnPct - a.holdPct;
+    const K = [['Equity', fmtUsd(a.equity), ''], ['Return', fmtPct(a.returnPct), cls(a.returnPct)], ['Just holding', fmtPct(a.holdPct), cls(a.holdPct)], ['vs hold', fmtPct(vs), cls(vs)], ['Trades', a.trades, ''], [a.mode === 'paper' ? 'Fees paid' : 'Start equity', a.mode === 'paper' ? fmtUsd(a.feesPaid) : fmtUsd(a.startCash), ''], ['Position', a.inPosition ? `${a.side === 'short' ? 'Short' : 'Long'} from ${fmtPx(a.entryPrice)}` : 'Cash', '']];
+    if (a.market.startsWith('perp:')) K.push(['Funding', fmtUsd(-a.fundingPaid), cls(-a.fundingPaid)]);
+    $('#aK').innerHTML = K.map(([l, v, c]) => `<div class="card k"><small>${l}</small><b class="${c}">${v}</b></div>`).join('');
+    const P = a.params, S = { momentum: [['window', 'Breakout window', 'h'], ['trail', 'Trailing stop', '%']], meanrev: [['avg', 'Average window', 'h'], ['sigma', 'Entry distance', 'σ'], ['stopLoss', 'Stop loss', '%']], rsi: [['period', 'RSI period', 'h'], ['buyBelow', 'Buy below', ''], ['sellAbove', 'Sell above', '']], dip: [['trend', 'Trend average', 'h'], ['dipWin', 'Dip window', 'h'], ['depth', 'Dip depth', 'σ'], ['trail', 'Trailing stop', '%']], custom: [['fast', 'Fast average', ''], ['slow', 'Slow average', '']] }[a.strategy] || [];
+    const rows = [['Strategy', a.strategyLabel], ['Market', a.marketLabel], ...(a.market.startsWith('perp:') ? [['Direction', a.side], ['Leverage', a.leverage + 'x']] : []), ...S.map(([k, l, u]) => [l, P[k] + u]), ['Stop loss', P.stopLoss ? P.stopLoss + '%' : 'off'], ['Take profit', P.takeProfit ? P.takeProfit + '%' : 'off'], ['Max loss 24h', P.maxLoss24h ? P.maxLoss24h + '%' : 'off'], ['Position size', P.positionPct + '%']];
+    $('#aSettings').innerHTML = rows.map(([l, v]) => `<div>${l}</div><div>${esc(v)}</div>`).join('');
+    const bt = a.backtest;
+    $('#aBt').innerHTML = bt ? `<div>Return</div><div class="${cls(bt.returnPct)}">${fmtPct(bt.returnPct)}</div><div>Just holding</div><div class="${cls(bt.holdPct)}">${fmtPct(bt.holdPct)}</div><div>Trades</div><div>${bt.trades}</div>` : '<div>—</div><div></div>';
+    $('#aOg').src = `/og/agent/${a.id}`;
+    $('#aFoot').textContent = a.mode === 'paper' ? 'Paper agent: virtual money on live prices, 0.1% cost per trade. “Just holding” means buying the market when the agent started. Past results do not predict future returns.' : 'Live agent: trades real funds. Return is measured from the equity at its first run; deposits and withdrawals move it. Past results do not predict future returns.';
+    const tr = a.decisions.filter((d) => showAll || !['hold'].includes(d.action));
+    $('#aTrades').innerHTML = tr.length ? tr.slice(0, showAll ? 400 : 60).map((d) => `<div class="trow"><span class="muted">${fmtDT(d.at)}</span><span class="tag ${d.action}">${d.action}</span><span>${d.price ? fmtPx(d.price) : ''}</span><span>${esc(d.reason)}${d.tx ? ` <a href="${EXPL}/tx/${d.tx}" target="_blank">tx ↗</a>` : ''}</span></div>`).join('') : '<div class="empty">No trades yet. The agent decides once an hour.</div>';
+    draw();
+    // actions
+    const isOwner = session && a.ownerFull && session.address.toLowerCase() === a.ownerFull.toLowerCase();
+    $('#aActs').innerHTML = `<button class="btn primary" data-share="x">Share on X</button><button class="btn" data-share="copy">Copy link</button><a class="btn" href="/agents/?copy=${a.id}">Copy this setup</a>`;
+    const own = $('#aOwner');
+    if (isOwner) {
+      own.style.display = 'block';
+      const canLive = a.mode === 'paper' && a.ageHours >= 72 && a.side !== 'short' && a.leverage === 1 && ['crypto:ETH', 'crypto:BTC'].concat((await abi()).liveMarkets).includes(a.market);
+      own.innerHTML = `<h3>Your agent</h3><div class="chips" style="margin-top:10px">${a.status === 'active' ? '<button class="btn sm" data-act="pause">Pause</button>' : '<button class="btn sm" data-act="resume">Resume</button>'}<button class="btn sm" data-act="edit">Edit settings</button><button class="btn sm danger" data-act="delete">Delete</button></div>${canLive ? '<button class="btn primary block" style="margin-top:12px" data-act="golive">Go live with these settings</button>' : a.mode === 'paper' ? '<p class="note">Go live unlocks after 3 days on paper for long 1x agents on ETH, BTC or a stock token.</p>' : ''}`;
+      $$('[data-act]', own).forEach((b) => (b.onclick = () => ownerAct(b.dataset.act)));
+    }
+  };
+  const ownerAct = async (act) => {
+    try {
+      if (act === 'delete') {
+        modal(`<h3>Delete ${esc(a.name)}?</h3><p class="hint" style="margin-top:6px">This removes the agent and its history from ORLA. Vault funds are not touched.</p><div class="row2" style="margin-top:14px"><button class="btn" onclick="document.getElementById('modal').remove()">Cancel</button><button class="btn danger" id="mDel">Delete</button></div>`);
+        $('#mDel').onclick = async () => { await postJSON(`/api/me/agents/${a.id}`, {}, 'DELETE'); location.href = '/agents/'; };
+        return;
+      }
+      if (act === 'edit') {
+        const keys = Object.keys(a.params).filter((k) => !['side', 'leverage'].includes(k) || a.market.startsWith('perp:'));
+        modal(`<h3>Edit settings</h3><p class="hint">Strategy and market stay fixed so the comparison with holding stays fair.</p><div class="row2">${keys.map((k) => `<div><label class="f">${k}</label>${k === 'side' ? `<select class="inp" data-k="side"><option ${a.params.side === 'long' ? 'selected' : ''}>long</option><option ${a.params.side === 'short' ? 'selected' : ''}>short</option></select>` : `<input class="inp" data-k="${k}" type="number" step="any" value="${a.params[k]}">`}</div>`).join('')}</div><div class="err" id="mErr"></div><button class="btn primary block" id="mSave" style="margin-top:12px">Save</button>`);
+        $('#mSave').onclick = async () => {
+          const params = {}; $$('#modal [data-k]').forEach((i) => (params[i.dataset.k] = i.dataset.k === 'side' ? i.value : Number(i.value)));
+          try { await postJSON(`/api/me/agents/${a.id}`, { action: 'edit', params }); closeModal(); load(); } catch (e) { $('#mErr').textContent = e.message; }
+        };
+        return;
+      }
+      if (act === 'golive') { location.href = `/agents/?copy=${a.id}&mode=live`; return; }
+      await postJSON(`/api/me/agents/${a.id}`, { action: act }); load();
+    } catch (e) { toast(`<b style="color:var(--down)">${esc(e.message)}</b>`); }
+  };
+  $$('#aRange .chip').forEach((b) => (b.onclick = () => { range = Number(b.dataset.r); $$('#aRange .chip').forEach((x) => x.classList.toggle('on', x === b)); draw(); }));
+  $('#allDec').onclick = () => { showAll = !showAll; $('#allDec').textContent = showAll ? 'Show trades only' : 'Show every hourly decision'; load(); };
+  document.addEventListener('click', (e) => {
+    const s = e.target.closest('[data-share]'); if (!s || !a) return;
+    const url = `${location.origin}/agent/?id=${a.id}`;
+    if (s.dataset.share === 'x') window.open(`https://x.com/intent/post?text=${encodeURIComponent(`${a.name} is ${fmtPct(a.returnPct)} on ${a.marketLabel} (${fmtPct(a.returnPct - a.holdPct)} vs holding) — an ORLA ${a.mode === 'paper' ? 'paper ' : ''}agent`)}&url=${encodeURIComponent(url)}`, '_blank');
+    else navigator.clipboard.writeText(url).then(() => toast('<b>Link copied</b>', 2500));
+  });
+  await loadSession();
+  try { await load(); } catch (e) { $('#aName').textContent = 'Agent not found'; $('#aMeta').textContent = e.message; }
+  setInterval(() => load().catch(() => {}), 120_000);
+};
+
+// ------------------------------------------------------------------ leaderboard
+pages.leaderboard = async () => {
+  loadStats();
+  const f = {};
+  const load = async () => {
+    $$('#lbFilters select').forEach((s) => (f[s.dataset.f] = s.value));
+    const q = new URLSearchParams(f).toString();
+    const { agents } = await getJSON(`/api/agents/leaderboard?${q}`);
+    $('#lbBody').innerHTML = agents.length ? agents.map((a, i) => `<tr data-id="${a.id}"><td class="num muted">${String(i + 1).padStart(2, '0')}</td><td class="nm"><b>${esc(a.name)}</b><small>${esc(a.owner)}</small></td><td class="hm">${esc(a.strategyLabel)}${a.side === 'short' ? ' · short' : ''}${a.leverage > 1 ? ` · ${a.leverage}x` : ''}</td><td>${esc(a.marketLabel)} ${a.mode !== 'paper' ? '<span class="tag accent">live</span>' : ''}</td><td class="num hm">${a.trades}</td><td class="num hm">${fmtAge(a.ageHours)}</td><td class="num ${cls(a.returnPct)}">${fmtPct(a.returnPct)}</td><td class="num ${cls(a.returnPct - a.holdPct)}">${fmtPct(a.returnPct - a.holdPct)}</td><td><a class="btn sm" href="/agents/?copy=${a.id}" onclick="event.stopPropagation()">Copy</a></td></tr>`).join('') : '<tr><td colspan="9" class="empty">No agents match these filters yet.</td></tr>';
+    $$('#lbBody tr[data-id]').forEach((r) => (r.onclick = () => (location.href = `/agent/?id=${r.dataset.id}`)));
+    const top = agents[0];
+    if (top) {
+      const { agent } = await getJSON(`/api/agents/${top.id}`);
+      $('#lbTopName').textContent = `${agent.name} · ${agent.marketLabel} · ${agent.strategyLabel}`;
+      chart($('#lbChart'), [{ pts: agent.curve.map((x) => [x[0], x[1]]), color: '#ffb020', width: 2, fill: true }, { pts: agent.curve.map((x) => [x[0], x[2]]), color: '#f3efe6', width: 1.4 }], { base: agent.startCash });
+    } else { $('#lbTopName').textContent = 'No ranked agent yet'; $('#lbChart').innerHTML = '<div class="empty">Launch an agent and it will show up here.</div>'; }
+  };
+  $$('#lbFilters select').forEach((s) => (s.onchange = load));
+  load();
+};
+
+// ------------------------------------------------------------------ pools
+pages.pools = async () => {
+  const a = await abi();
+  const WETH = a.tokens.find((t) => t.symbol === 'WETH'), USDG = a.tokens.find((t) => t.symbol === 'USDG');
+  let stats = null, ethPx = null;
+  // fee simulator from real ETH hourly moves
+  const sim = async () => {
+    try {
+      const { bars } = await getJSON('/api/candles?market=crypto:ETH&hours=48');
+      const last = bars.slice(-41);
+      ethPx = last[last.length - 1].c;
+      const moves = last.slice(1).map((b, i) => Math.abs(Math.log(b.c / last[i].c)) * 100);
+      const vol = moves.slice(-24).reduce((x, y) => x + y, 0) / 24;
+      const fee = Math.min(1, 0.05 + vol * 0.25);
+      const mx = Math.max(...moves) || 1;
+      $('#simBars').innerHTML = moves.map((m) => `<i style="height:${Math.max(4, (m / mx) * 100)}%"></i>`).join('');
+      $('#simPx').textContent = fmtPx(ethPx); $('#simVol').textContent = vol.toFixed(2) + '%';
+      const live = stats?.fee?.total;
+      const f = live ?? fee;
+      $('#simFeeTop').textContent = f.toFixed(2) + '%';
+      const calc = () => { const v = Number($('#simIn').value) || 0; $('#simOut').value = ((v * (1 - f / 100)) / ethPx).toFixed(5); };
+      $('#simIn').oninput = calc; calc();
+    } catch (_) {}
+  };
+  const loadStats2 = async () => {
+    try {
+      stats = await getJSON('/api/pools/stats');
+      if (!stats.enabled) {
+        $('#poolStatus').textContent = 'launching soon';
+        $('#pStats').innerHTML = ['Swaps', 'Volume', 'Sent to payroll', 'Fee right now'].map((l) => `<div class="card pstat"><div class="l">${l}</div><div class="v">—</div><small>pool not deployed yet</small></div>`).join('');
+        return;
+      }
+      const s = stats;
+      $('#pStats').innerHTML = [['Swaps', s.swaps.toLocaleString(), `${s.swaps24h} in the last 24h`], ['Volume', fmtUsd(s.volume, 0), `${fmtUsd(s.volume24h, 0)} in the last 24h`], ['Sent to payroll', s.payroll ? `${s.payroll.shareBps / 100}%` : 'Not set', s.payroll ? `share to ${short(s.payroll.payroll)}` : 'no payroll share on this pool yet'], ['Fee right now', s.fee ? s.fee.total.toFixed(2) + '%' : '—', s.fee ? `LP ${s.fee.lp.toFixed(2)}% · payroll ${s.fee.payroll.toFixed(2)}%` : 'pool not initialized']]
+        .map(([l, v, sm]) => `<div class="card pstat reveal in"><div class="l">${l}</div><div class="v">${v}</div><small>${sm}</small></div>`).join('');
+      $('#pSwaps').innerHTML = s.latest.length ? s.latest.map((x) => `<div class="swaprow"><span class="tag ${x.buy ? 'green' : 'red'}">${x.buy ? 'Buy WETH' : 'Sell WETH'}</span><span>${fmtUsd(x.usd)}</span><span class="muted">fee ${(x.fee / 1e4).toFixed(2)}%</span><a class="muted" href="${EXPL}/tx/${x.tx}" target="_blank">${fmtDT(x.at)} ↗</a></div>`).join('') : '<div class="empty">No swaps yet.</div>';
+      $('#hookLink').href = `${EXPL}/address/${s.pool.hook}`;
+      $('#pBlock').textContent = s.block ? `Read from Robinhood Chain up to block ${Number(s.block).toLocaleString()}${s.pool.since ? ` · pool live since ${new Date(s.pool.since).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}` : ''}.` : '';
+      if (s.fee) $('#lpFee').textContent = `Hook fee now ${s.fee.total.toFixed(2)}% · LP ${s.fee.lp.toFixed(2)}%`;
+    } catch (_) {}
+  };
+  await loadStats2(); sim();
+
+  // swap box: hooked pool (v4, via OrlaSwapRouter) or Uniswap V3 (best fee tier)
+  let dir = 'buy', venue = 'hook', quote = null;
+  const swapBox = () => {
+    const pool = stats?.pool;
+    const hasHook = !!(pool && pool.router);
+    if (!hasHook) venue = 'v3';
+    const [inS, outS] = dir === 'buy' ? ['USDG', 'WETH'] : ['WETH', 'USDG'];
+    $('#swapBox').innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><h3>Swap · WETH / USDG</h3><button class="flip" id="flip">${inS} → ${outS} ⇄</button></div>
+    ${hasHook ? `<div class="chips" style="margin-top:10px"><button class="chip ${venue === 'hook' ? 'on' : ''}" data-v="hook">Hooked pool</button><button class="chip ${venue === 'v3' ? 'on' : ''}" data-v="v3">Uniswap V3</button></div>` : ''}
+    <label class="f">You pay (${inS})</label><input class="inp mono" id="swIn" placeholder="0.00" inputmode="decimal">
+    <div class="box" style="margin-top:10px;border:1px solid var(--line);border-radius:10px;padding:10px 12px"><small class="muted">You receive (≈)</small><div class="mono" id="swOut" style="font-size:18px">–</div></div>
+    <button class="btn ${session ? 'primary' : 'light'} block" id="swGo" style="margin-top:12px">${session ? 'Swap' : 'Connect wallet'}</button>
+    <p class="note">${venue === 'hook' ? 'Hooked v4 pool through the ORLA router, quoted by Uniswap\'s v4 Quoter including the hook fee. Minimum output = quote − 1%.' : 'Uniswap V3 through its official router, using the fee tier with the best price. Tokens go straight to your wallet.'}</p>`;
+    $('#flip').onclick = () => { dir = dir === 'buy' ? 'sell' : 'buy'; swapBox(); };
+    $$('#swapBox [data-v]').forEach((b) => (b.onclick = () => { venue = b.dataset.v; swapBox(); }));
+    let qt;
+    $('#swIn').oninput = () => { clearTimeout(qt); qt = setTimeout(doQuote, 300); };
+    $('#swGo').onclick = doSwap;
+  };
+  const QV3 = [{ type: 'function', name: 'quoteExactInputSingle', stateMutability: 'nonpayable', inputs: [{ type: 'tuple', name: 'p', components: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'amountIn', type: 'uint256' }, { name: 'fee', type: 'uint24' }, { name: 'sqrtPriceLimitX96', type: 'uint160' }] }], outputs: [{ name: 'amountOut', type: 'uint256' }, { type: 'uint160' }, { type: 'uint32' }, { type: 'uint256' }] }];
+  const QV4 = [{ type: 'function', name: 'quoteExactInputSingle', stateMutability: 'nonpayable', inputs: [{ type: 'tuple', name: 'p', components: [{ name: 'poolKey', type: 'tuple', components: [{ name: 'currency0', type: 'address' }, { name: 'currency1', type: 'address' }, { name: 'fee', type: 'uint24' }, { name: 'tickSpacing', type: 'int24' }, { name: 'hooks', type: 'address' }] }, { name: 'zeroForOne', type: 'bool' }, { name: 'exactAmount', type: 'uint128' }, { name: 'hookData', type: 'bytes' }] }], outputs: [{ name: 'amountOut', type: 'uint256' }, { name: 'gasEstimate', type: 'uint256' }] }];
+  const R02 = [{ type: 'function', name: 'exactInputSingle', stateMutability: 'payable', inputs: [{ type: 'tuple', name: 'p', components: [{ name: 'tokenIn', type: 'address' }, { name: 'tokenOut', type: 'address' }, { name: 'fee', type: 'uint24' }, { name: 'recipient', type: 'address' }, { name: 'amountIn', type: 'uint256' }, { name: 'amountOutMinimum', type: 'uint256' }, { name: 'sqrtPriceLimitX96', type: 'uint160' }] }], outputs: [{ type: 'uint256' }] }];
+  const doQuote = async () => {
+    quote = null;
+    const amt = $('#swIn').value;
+    if (!(Number(amt) > 0)) { $('#swOut').textContent = '–'; return; }
+    $('#swOut').innerHTML = '<span class="spin"></span>';
+    try {
+      const { p, v } = await readClient();
+      const [tIn, tOut] = dir === 'buy' ? [USDG, WETH] : [WETH, USDG];
+      const dIn = tIn.symbol === 'USDG' ? 6 : 18, dOut = tOut.symbol === 'USDG' ? 6 : 18;
+      const amountIn = v.parseUnits(amt, dIn);
+      if (venue === 'hook') {
+        const key = { currency0: WETH.address, currency1: USDG.address, fee: 0x800000, tickSpacing: 60, hooks: stats.pool.hook };
+        const { result } = await p.simulateContract({ address: a.uni.v4Quoter, abi: QV4, functionName: 'quoteExactInputSingle', args: [{ poolKey: key, zeroForOne: dir === 'sell', exactAmount: amountIn, hookData: '0x' }] });
+        quote = { amountIn, out: result[0], key, dOut };
+      } else {
+        let best = null;
+        for (const fee of [100, 500, 3000, 10000]) {
+          try { const { result } = await p.simulateContract({ address: a.uni.v3Quoter, abi: QV3, functionName: 'quoteExactInputSingle', args: [{ tokenIn: tIn.address, tokenOut: tOut.address, amountIn, fee, sqrtPriceLimitX96: 0n }] }); if (!best || result[0] > best.out) best = { fee, out: result[0] }; } catch (_) {}
+        }
+        if (!best) throw new Error('No liquidity for this amount.');
+        quote = { amountIn, out: best.out, fee: best.fee, tIn, tOut, dOut };
+      }
+      $('#swOut').textContent = `${fmtN(Number(v.formatUnits(quote.out, quote.dOut)), 6)} ${dir === 'buy' ? 'WETH' : 'USDG'}${quote.fee ? ` · ${quote.fee / 1e4}% tier` : ''}`;
+    } catch (e) { $('#swOut').textContent = venue === 'hook' ? 'No quote — the hooked pool may need liquidity.' : 'No quote available.'; }
+  };
+  const doSwap = async () => {
+    if (!session) return connect().then(swapBox).catch(() => {});
+    if (!quote) return toast('<b>Enter an amount first.</b>');
+    const { account } = await wallet();
+    const minOut = (quote.out * 99n) / 100n;
+    if (venue === 'hook') {
+      const tIn = dir === 'buy' ? USDG : WETH;
+      await ensureAllowance(tIn.address, stats.pool.router, quote.amountIn, `Approve ${tIn.symbol}`);
+      await tx('Swap in the hooked pool', (w) => w.writeContract({ address: stats.pool.router, abi: a.abi.OrlaSwapRouter, functionName: 'swapExactIn', args: [quote.key, dir === 'sell', quote.amountIn, minOut, BigInt(Math.floor(Date.now() / 1000) + 600)] }));
+    } else {
+      await ensureAllowance(quote.tIn.address, a.uni.swapRouter02, quote.amountIn, `Approve ${quote.tIn.symbol}`);
+      await tx('Swap on Uniswap V3', (w) => w.writeContract({ address: a.uni.swapRouter02, abi: R02, functionName: 'exactInputSingle', args: [{ tokenIn: quote.tIn.address, tokenOut: quote.tOut.address, fee: quote.fee, recipient: account, amountIn: quote.amountIn, amountOutMinimum: minOut, sqrtPriceLimitX96: 0n }] }));
+    }
+    loadStats2();
+  };
+  swapBox();
+
+  // LP vault
+  const lpCard = async () => {
+    const box = $('#lpVault');
+    if (!session) return;
+    let lp;
+    try { lp = await getJSON('/api/me/lp'); } catch (e) { box.innerHTML = `<h3>WETH / USDG LP vault</h3><p class="hint">${esc(e.message)}</p>`; return; }
+    if (!lp.enabled) { box.innerHTML = '<h3>WETH / USDG LP vault</h3><p class="hint">The hooked pool is not deployed yet.</p>'; return; }
+    const pool = lp.pool;
+    const key = { currency0: WETH.address, currency1: USDG.address, fee: 0x800000, tickSpacing: 60, hooks: pool.hook };
+    if (!lp.vault) {
+      box.innerHTML = `<h3>WETH / USDG LP vault</h3><p class="hint">Set your limits, then create the vault. The agent will open a range within the hour after you deposit.</p>
+      <div class="row2"><div><label class="f">Narrowest range (%)</label><input class="inp" id="lMin" type="number" value="4"></div><div><label class="f">Widest range (%)</label><input class="inp" id="lMax" type="number" value="20"></div>
+      <div><label class="f">Min hours between moves</label><input class="inp" id="lInt" type="number" value="2"></div><div><label class="f">Oracle band (%)</label><input class="inp" id="lDev" type="number" value="1" step="0.1"></div></div>
+      <button class="btn primary" id="lCreate" style="margin-top:14px">Create LP vault</button>`;
+      $('#lCreate').onclick = async () => {
+        const pctToTicks = (p) => Math.max(120, Math.round(Math.log(1 + p / 100) / Math.log(1.0001) / 60) * 60);
+        await tx('Create LP vault', (w) => w.writeContract({ address: pool.lpFactory, abi: a.abi.OrlaLPVaultFactory, functionName: 'createVault', args: [key, pool.feed0, pool.feed1, 90000, pctToTicks(+$('#lMin').value), pctToTicks(+$('#lMax').value), Math.round(+$('#lInt').value * 3600), Math.round(+$('#lDev').value * 100)] }));
+        lpCard();
+      };
+      return;
+    }
+    const inRange = lp.tick != null && lp.tickLower != null && lp.tick >= lp.tickLower && lp.tick < lp.tickUpper && (lp.position?.weth > 0 || lp.position?.usdg > 0);
+    box.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><h3>WETH / USDG LP vault</h3><span class="tag ${inRange ? 'green' : ''}">${inRange ? 'in range' : lp.position && (lp.position.weth || lp.position.usdg) ? 'out of range' : 'idle'}</span></div>
+    <div class="bal" style="grid-template-columns:repeat(2,1fr)"><div><small>In position</small><b>${fmtN(lp.position?.weth || 0, 5)} WETH</b><small>${fmtN(lp.position?.usdg || 0, 2)} USDG</small></div><div><small>Idle in vault</small><b>${fmtN(lp.idle.weth, 5)} WETH</b><small>${fmtN(lp.idle.usdg, 2)} USDG</small></div></div>
+    <p class="hint mono">tick ${lp.tick ?? '—'} · range ${lp.tickLower ?? '—'} … ${lp.tickUpper ?? '—'} · <a class="up" href="${EXPL}/address/${lp.vault}" target="_blank">${short(lp.vault)} ↗</a></p>
+    <div class="row2" style="margin-top:8px"><div><label class="f">Deposit WETH</label><div style="display:flex;gap:6px"><input class="inp" id="dW" placeholder="0.01"><button class="btn sm" id="dWb">Deposit</button></div></div><div><label class="f">Deposit USDG</label><div style="display:flex;gap:6px"><input class="inp" id="dU" placeholder="25"><button class="btn sm" id="dUb">Deposit</button></div></div></div>
+    <div class="chips" style="margin-top:12px"><button class="btn sm" id="lExit">Exit pool</button><button class="btn sm" id="lWd">Withdraw all</button><button class="btn sm" id="lPause">${lp.paused ? 'Resume' : 'Pause'}</button><button class="btn sm" id="lAcc">${lp.agentAccess ? 'Revoke agent' : 'Give agent access'}</button></div>`;
+    const LA = a.abi.OrlaLPVault;
+    $('#dWb').onclick = async () => { const { v } = await wallet(); await tx('Deposit WETH', (w) => w.writeContract({ address: WETH.address, abi: ERC20, functionName: 'transfer', args: [lp.vault, v.parseUnits($('#dW').value || '0', 18)] })); lpCard(); };
+    $('#dUb').onclick = async () => { const { v } = await wallet(); await tx('Deposit USDG', (w) => w.writeContract({ address: USDG.address, abi: ERC20, functionName: 'transfer', args: [lp.vault, v.parseUnits($('#dU').value || '0', 6)] })); lpCard(); };
+    $('#lExit').onclick = async () => { await tx('Exit pool', (w) => w.writeContract({ address: lp.vault, abi: LA, functionName: 'exit' })); lpCard(); };
+    $('#lWd').onclick = async () => { const { account } = await wallet(); const max = 2n ** 256n - 1n; await tx('Withdraw WETH', (w) => w.writeContract({ address: lp.vault, abi: LA, functionName: 'withdraw', args: [WETH.address, max, account] })); await tx('Withdraw USDG', (w) => w.writeContract({ address: lp.vault, abi: LA, functionName: 'withdraw', args: [USDG.address, max, account] })); lpCard(); };
+    $('#lPause').onclick = async () => { await tx(lp.paused ? 'Resume LP vault' : 'Pause LP vault', (w) => w.writeContract({ address: lp.vault, abi: LA, functionName: 'setPaused', args: [!lp.paused] })); lpCard(); };
+    $('#lAcc').onclick = async () => { const c = await cfg(); await tx(lp.agentAccess ? 'Revoke agent' : 'Give agent access', (w) => w.writeContract({ address: lp.vault, abi: LA, functionName: 'setOperator', args: [lp.agentAccess ? '0x0000000000000000000000000000000000000000' : c.bot] })); lpCard(); };
+    $('#lpLog').innerHTML = lp.log.length ? lp.log.map((l) => `<div>${fmtDT(l.at)} · <span class="tag ${l.action === 'rebalance' ? 'accent' : ''}">${l.action}</span> ${esc(l.reason)} ${l.tx ? `<a class="up" href="${EXPL}/tx/${l.tx}" target="_blank">tx ↗</a>` : ''}</div>`).join('') : '<p class="hint">No decisions yet. The agent checks your vault every hour.</p>';
+  };
+
+  // Pons swap
+  let pn = { info: null, side: 'buy' };
+  const ponsLoad = async () => {
+    const addr = $('#ponsAddr').value.trim();
+    const out = $('#ponsOut');
+    if (!/^0x[0-9a-fA-F]{40}$/.test(addr)) { out.innerHTML = addr ? '<p class="err">That is not a valid contract address.</p>' : ''; return; }
+    out.innerHTML = '<p class="hint"><span class="spin"></span> Reading the token…</p>';
+    try { pn.info = await getJSON(`/api/pons/token?address=${addr}`); ponsDraw(); history.replaceState(null, '', `?token=${addr}#pons`); }
+    catch (e) { out.innerHTML = `<p class="err">${esc(e.message)}</p>`; }
+  };
+  const ponsDraw = () => {
+    const t = pn.info, out = $('#ponsOut');
+    const inSym = pn.side === 'buy' ? t.pairSymbol : t.symbol, outSym = pn.side === 'buy' ? t.symbol : t.pairSymbol;
+    out.innerHTML = `<div class="callout" style="margin-top:12px"><span><b>${esc(t.name)}</b> <span class="mono">$${esc(t.symbol)}</span> · ${t.status === 'curve' ? `bonding curve ${t.progressPct.toFixed(1)}%` : 'graduated'} · paired with ${t.pairSymbol}</span><a href="${EXPL}/token/${t.token}" target="_blank">↗</a></div>
+    ${t.note ? `<p class="hint">${esc(t.note)}</p>` : ''}
+    ${t.status === 'curve' ? `<div class="chips" style="margin-top:12px"><button class="chip ${pn.side === 'buy' ? 'on' : ''}" data-side="buy">Buy</button><button class="chip ${pn.side === 'sell' ? 'on' : ''}" data-side="sell">Sell</button></div>
+    <label class="f">You pay (${esc(inSym)})</label><input class="inp mono" id="pnIn" placeholder="0.00"><p class="mono" id="pnQ" style="margin-top:8px">–</p>
+    <button class="btn ${session ? 'primary' : 'light'} block" id="pnGo" style="margin-top:8px">${session ? `Swap ${esc(inSym)} → ${esc(outSym)}` : 'Connect wallet'}</button>
+    <p class="note">Curve fee ${t.curveFeePct ?? '—'}%${t.creatorTaxPct ? ` + creator tax ${t.creatorTaxPct}%` : ''}. 1% slippage limit.</p>` : `<p class="hint" style="margin-top:12px">Graduated tokens trade on their Uniswap v4 pool. <a class="up" href="https://ponsfamily.com/token/${t.token}" target="_blank">Open on Pons ↗</a></p>`}`;
+    $$('#ponsOut [data-side]').forEach((b) => (b.onclick = () => { pn.side = b.dataset.side; ponsDraw(); }));
+    let qt; const q = $('#pnIn');
+    if (!q) return;
+    q.oninput = () => { clearTimeout(qt); qt = setTimeout(ponsQuote, 350); };
+    $('#pnGo').onclick = ponsSwap;
+  };
+  const ponsQuote = async () => {
+    pn.quote = null;
+    const amt = $('#pnIn').value;
+    if (!(Number(amt) > 0)) { $('#pnQ').textContent = '–'; return; }
+    try {
+      pn.quote = await getJSON(`/api/pons/quote?token=${pn.info.token}&side=${pn.side}&amount=${amt}${session ? `&user=${session.address}` : ''}`);
+      $('#pnQ').textContent = `≈ ${fmtN(pn.quote.amountOut, 6)} ${pn.side === 'buy' ? pn.info.symbol : pn.info.pairSymbol} · fees ${pn.quote.feePct}%`;
+    } catch (e) { $('#pnQ').textContent = e.message; }
+  };
+  const ponsSwap = async () => {
+    if (!session) return connect().then(ponsDraw).catch(() => {});
+    if (!pn.quote) return toast('<b>Enter an amount first.</b>');
+    const t = pn.info, q = pn.quote;
+    const { account } = await wallet();
+    const CURVE = [{ type: 'function', name: 'buy', stateMutability: 'payable', inputs: [{ type: 'uint256' }, { type: 'uint256' }, { type: 'address' }], outputs: [{ type: 'uint256' }] }, { type: 'function', name: 'sell', stateMutability: 'nonpayable', inputs: [{ type: 'uint256' }, { type: 'uint256' }, { type: 'address' }], outputs: [{ type: 'uint256' }] }];
+    const inRaw = BigInt(q.amountInRaw), minOut = BigInt(q.minOutRaw);
+    if (pn.side === 'buy') {
+      if (!t.isNative) await ensureAllowance(t.pairToken, t.curve, inRaw, `Approve ${t.pairSymbol}`);
+      await tx(`Buy $${t.symbol}`, (w) => w.writeContract({ address: t.curve, abi: CURVE, functionName: 'buy', args: [inRaw, minOut, account], value: t.isNative ? inRaw : 0n }));
+    } else {
+      await ensureAllowance(t.token, t.curve, inRaw, `Approve $${t.symbol}`);
+      await tx(`Sell $${t.symbol}`, (w) => w.writeContract({ address: t.curve, abi: CURVE, functionName: 'sell', args: [inRaw, minOut, account] }));
+    }
+  };
+  $('#ponsAddr').addEventListener('input', () => { clearTimeout(window.__pt); window.__pt = setTimeout(ponsLoad, 300); });
+  const preTok = new URLSearchParams(location.search).get('token');
+  if (preTok) { $('#ponsAddr').value = preTok; ponsLoad(); }
+
+  document.addEventListener('orla:session', () => { swapBox(); lpCard(); if (pn.info) ponsDraw(); });
+  await loadSession();
+  swapBox(); lpCard();
+  setInterval(loadStats2, 60_000);
+};
+
+// ------------------------------------------------------------------ payroll
+pages.payroll = async () => {
+  const draw = async () => {
+    const box = $('#payBox');
+    if (!session) return;
+    box.innerHTML = '<span class="spin"></span>';
+    let p;
+    try { p = await getJSON('/api/me/payroll'); } catch (e) { box.innerHTML = `<p class="hint">${esc(e.message)}</p>`; return; }
+    const a = await abi();
+    if (!p.enabled) { box.innerHTML = '<span class="tag">Soon</span><h3 style="margin:12px 0 6px">Payroll is being set up.</h3><p class="hint">Check back shortly.</p>'; return; }
+    if (!p.payroll) {
+      box.innerHTML = '<span class="tag green">Live</span><h3 style="margin:12px 0 6px;font-size:20px">Create your payroll vault.</h3><p class="hint">One per wallet. Only you can manage it or withdraw.</p><button class="btn primary" id="pCreate" style="margin-top:14px">Create payroll vault</button>';
+      $('#pCreate').onclick = async () => { await tx('Create payroll vault', (w) => w.writeContract({ address: p.factory, abi: a.abi.PayrollFactory, functionName: 'createPayroll' })); draw(); };
+      return;
+    }
+    const PV = a.abi.PayrollVault;
+    const USDG = a.tokens.find((t) => t.symbol === 'USDG');
+    box.innerHTML = `<div style="display:flex;justify-content:space-between;align-items:center"><h3 style="font-size:19px">Payroll vault</h3><div class="chips">${p.paused ? '<span class="tag red">paused</span>' : '<span class="tag green">active</span>'}<a class="tag" href="${EXPL}/address/${p.payroll}" target="_blank">${short(p.payroll)} ↗</a></div></div>
+    <div class="bal" style="grid-template-columns:repeat(3,1fr)"><div><small>Balance</small><b>${fmtUsd(p.balance)}</b></div><div><small>Monthly cost</small><b>${fmtUsd(p.monthlyCost)}</b></div><div><small>Runway</small><b>${p.runwayDays == null ? '—' : Math.floor(p.runwayDays) + ' days'}</b></div></div>
+    ${p.dueCount ? `<div class="callout" style="margin-top:10px"><span>${p.dueCount} payment${p.dueCount > 1 ? 's' : ''} due · ${fmtUsd(p.dueAmount)}</span><a href="#" id="pPay">Pay due now</a></div>` : ''}
+    <label class="f">Deposit USDG</label><div style="display:flex;gap:8px"><input class="inp" id="pDep" placeholder="100"><button class="btn" id="pDepB">Deposit</button></div>
+    <h3 style="margin-top:18px">Recipients · ${p.recipients.length}</h3>
+    <div>${p.recipients.map((r) => `<div class="recip"><span>${short(r.to)}</span><span>${fmtUsd(r.amount)}</span><span class="muted">every ${r.intervalDays === 7 ? 'week' : r.intervalDays === 14 ? '2 weeks' : r.intervalDays + ' days'} · next ${new Date(r.nextPayAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</span><button class="btn sm danger" data-rm="${r.id}">Remove</button></div>`).join('') || '<p class="hint">No recipients yet.</p>'}</div>
+    <fieldset><legend>Add recipient</legend><label class="f">Wallet address</label><input class="inp mono" id="rTo" placeholder="0x…"><div class="row2"><div><label class="f">Amount (USDG)</label><input class="inp" id="rAmt" placeholder="500"></div><div><label class="f">Schedule</label><select class="inp" id="rInt"><option value="7">Weekly</option><option value="14">Every 2 weeks</option><option value="30" selected>Monthly (30 days)</option></select></div></div><label class="f">First payment (empty = now)</label><input class="inp" id="rFirst" type="datetime-local"><button class="btn primary" id="rAdd" style="margin-top:12px">Add recipient</button></fieldset>
+    <div class="chips" style="margin-top:14px"><button class="btn sm" id="pPause">${p.paused ? 'Resume' : 'Pause'}</button><button class="btn sm" id="pWd">Withdraw</button></div>
+    ${p.log.length ? `<h3 style="margin-top:18px">Bot activity</h3><div class="dlog">${p.log.map((l) => `<div>${fmtDT(l.at)} · ${esc(l.note)} ${l.tx ? `<a class="up" href="${EXPL}/tx/${l.tx}" target="_blank">tx ↗</a>` : ''}</div>`).join('')}</div>` : ''}`;
+    $('#pDepB').onclick = async () => { const { v } = await wallet(); await tx('Deposit USDG', (w) => w.writeContract({ address: USDG.address, abi: ERC20, functionName: 'transfer', args: [p.payroll, v.parseUnits($('#pDep').value || '0', 6)] })); draw(); };
+    $('#pPay') && ($('#pPay').onclick = async (e) => { e.preventDefault(); await tx('Pay due salaries', (w) => w.writeContract({ address: p.payroll, abi: PV, functionName: 'payAllDue' })); draw(); });
+    $('#rAdd').onclick = async () => {
+      const { v } = await wallet();
+      const to = $('#rTo').value.trim();
+      if (!/^0x[0-9a-fA-F]{40}$/.test(to)) return toast('<b>Enter a valid wallet address.</b>');
+      const first = $('#rFirst').value ? Math.floor(new Date($('#rFirst').value).getTime() / 1000) : 0;
+      await tx('Add recipient', (w) => w.writeContract({ address: p.payroll, abi: PV, functionName: 'addRecipient', args: [v.getAddress(to), v.parseUnits($('#rAmt').value || '0', 6), Number($('#rInt').value) * 86400, BigInt(first)] }));
+      draw();
+    };
+    $$('[data-rm]').forEach((b) => (b.onclick = async () => { await tx('Remove recipient', (w) => w.writeContract({ address: p.payroll, abi: PV, functionName: 'removeRecipient', args: [BigInt(b.dataset.rm)] })); draw(); }));
+    $('#pPause').onclick = async () => { await tx(p.paused ? 'Resume payroll' : 'Pause payroll', (w) => w.writeContract({ address: p.payroll, abi: PV, functionName: 'setPaused', args: [!p.paused] })); draw(); };
+    $('#pWd').onclick = () => {
+      modal(`<h3>Withdraw USDG</h3><label class="f">Amount (or max)</label><input class="inp" id="mA" placeholder="max"><button class="btn primary block" id="mW" style="margin-top:12px">Withdraw</button>`);
+      $('#mW').onclick = async () => { const { v } = await wallet(); const val = $('#mA').value; const amt = !val || /max/i.test(val) ? 2n ** 256n - 1n : v.parseUnits(val, 6); closeModal(); await tx('Withdraw USDG', (w) => w.writeContract({ address: p.payroll, abi: PV, functionName: 'withdraw', args: [amt] })); draw(); };
+    };
+  };
+  document.addEventListener('orla:session', draw);
+  await loadSession();
+  draw();
+};
+
+// ------------------------------------------------------------------ portfolio
+pages.portfolio = async () => {
+  const draw = async () => {
+    if (!session) return;
+    const box = $('#pf');
+    box.innerHTML = '<div class="empty"><span class="spin"></span> Reading your agents and vaults…</div>';
+    const [ag, va, pa, lp] = await Promise.all([getJSON('/api/me/agents').catch(() => ({ agents: [] })), getJSON('/api/me/vault').catch(() => null), getJSON('/api/me/payroll').catch(() => null), getJSON('/api/me/lp').catch(() => null)]);
+    const live = va?.vault ? va.totalUsd : 0, pay = pa?.payroll ? pa.balance : 0;
+    const lpUsd = lp?.vault ? ((lp.position?.weth || 0) + lp.idle.weth) * ((va?.balances || []).find((b) => b.symbol === 'WETH')?.price || 0) + (lp.position?.usdg || 0) + lp.idle.usdg : 0;
+    const paper = ag.agents.filter((a) => a.mode === 'paper');
+    box.innerHTML = `<div class="kgrid" style="margin-bottom:14px">${[['On-chain total', fmtUsd(live + pay + lpUsd)], ['Live vault', va?.vault ? fmtUsd(live) : 'none'], ['LP vault', lp?.vault ? fmtUsd(lpUsd) : 'none'], ['Payroll', pa?.payroll ? fmtUsd(pay) : 'none']].map(([l, v]) => `<div class="card k"><small>${l}</small><b>${v}</b></div>`).join('')}</div>
+    <div class="pf-grid"><div class="card pad"><h3>Agents · ${ag.agents.length}</h3>${ag.agents.length ? ag.agents.map((a) => `<a class="trow" style="grid-template-columns:1fr 70px 90px 70px" href="/agent/?id=${a.id}"><span><b>${esc(a.name)}</b> <span class="muted">${esc(a.marketLabel)}</span></span><span class="tag ${a.mode === 'paper' ? '' : 'accent'}">${a.mode}</span><span>${fmtUsd(a.equity)}</span><span class="${cls(a.returnPct)}">${fmtPct(a.returnPct)}</span></a>`).join('') : '<p class="hint">No agents yet. <a class="up" href="/agents/">Build one →</a></p>'}
+    ${paper.length ? `<p class="note">Paper agents use virtual money and are not counted in the on-chain total.</p>` : ''}</div>
+    <div class="card pad"><h3>Vaults</h3><div class="kv" style="margin-top:8px"><div>Live vault</div><div>${va?.vault ? `<a class="up" href="${EXPL}/address/${va.vault}" target="_blank">${short(va.vault)}</a>` : '<a class="up" href="/agents/">create</a>'}</div><div>LP vault</div><div>${lp?.vault ? `<a class="up" href="${EXPL}/address/${lp.vault}" target="_blank">${short(lp.vault)}</a>` : '<a class="up" href="/pools/#lp">create</a>'}</div><div>Payroll</div><div>${pa?.payroll ? `<a class="up" href="${EXPL}/address/${pa.payroll}" target="_blank">${short(pa.payroll)}</a>` : '<a class="up" href="/payroll/">create</a>'}</div>${pa?.payroll ? `<div>Recipients</div><div>${pa.recipients.length}</div><div>Runway</div><div>${pa.runwayDays == null ? '—' : Math.floor(pa.runwayDays) + 'd'}</div>` : ''}</div></div></div>`;
+  };
+  document.addEventListener('orla:session', draw);
+  await loadSession();
+  draw();
+};
+
+// ------------------------------------------------------------------ token
+pages.token = async () => {
+  $('#tokCopy')?.addEventListener('click', () => navigator.clipboard.writeText($('#tokCa').textContent.trim()).then(() => { $('#tokCopy').textContent = 'Copied'; setTimeout(() => ($('#tokCopy').textContent = 'Copy'), 1500); }));
+};
+
+// ------------------------------------------------------------------ docs (scroll spy)
+pages.docs = async () => {
+  const links = $$('#docnav a');
+  const secs = links.map((l) => $(l.getAttribute('href'))).filter(Boolean);
+  const spy = () => { let cur = secs[0]; for (const s of secs) if (s.getBoundingClientRect().top < 120) cur = s; links.forEach((l) => l.classList.toggle('on', l.getAttribute('href') === '#' + cur.id)); };
+  addEventListener('scroll', spy, { passive: true }); spy();
+};
+
+// ------------------------------------------------------------------ setup console (admin)
+pages.setup = async () => {
+  const box = $('#setup');
+  const draw = async () => {
+    if (!session) return;
+    let info;
+    try { info = await getJSON('/api/setup/info'); } catch (e) { box.innerHTML = `<div class="card pad"><p class="err">${esc(e.message)}</p></div>`; return; }
+    const c = info.config;
+    const a = await abi();
+    const B = await getJSON('/assets/bytecode.json');
+    const done = (k) => (c[k] ? `<span class="tag green">done</span>` : '<span class="tag">todo</span>');
+    const btns = (k, label) => `<div class="row" style="gap:8px;flex-wrap:wrap"><button class="btn primary" data-b="${k}">${label} · bot pays gas</button><button class="btn" data-d="${k}">${label} · my wallet</button></div>`;
+    const { p: rp } = await readClient();
+    const ADM = [{ type: 'function', name: 'admin', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] }, { type: 'function', name: 'pendingAdmin', stateMutability: 'view', inputs: [], outputs: [{ type: 'address' }] }, { type: 'function', name: 'acceptAdmin', stateMutability: 'nonpayable', inputs: [], outputs: [] }];
+    const claims = [];
+    for (const [k, label] of [['agentVaultFactory', 'AgentVaultFactory'], ['lpFactory', 'OrlaLPVaultFactory']]) {
+      if (!c[k]) continue;
+      try {
+        const [ad, pend] = await Promise.all([rp.readContract({ address: c[k], abi: ADM, functionName: 'admin' }), rp.readContract({ address: c[k], abi: ADM, functionName: 'pendingAdmin' })]);
+        claims.push({ k, label, addr: c[k], isMe: ad.toLowerCase() === session.address.toLowerCase(), pendingMe: pend.toLowerCase() === session.address.toLowerCase() });
+      } catch (_) {}
+    }
+    const claimCard = claims.length ? `<div class="card step"><h3>8 · Admin rights ${claims.every((x) => x.isMe) ? '<span class="tag green">done</span>' : '<span class="tag">todo</span>'}</h3><p class="hint">Contracts deployed by the bot are handed to your wallet in two steps. Accept them here (a small transaction from your wallet).</p>${claims.map((x) => `<p class="hint"><b>${x.label}</b>: ${x.isMe ? 'admin is your wallet ✓' : x.pendingMe ? `<button class="btn primary" data-claim="${x.addr}">Accept admin</button>` : 'admin is another address'}</p>`).join('')}</div>` : '';
+    box.innerHTML = `
+    <div class="card step"><h3>0 · Bot wallet ${info.bot ? '<span class="tag green">ok</span>' : '<span class="tag red">missing</span>'}</h3>
+      <p class="hint">${info.bot ? `Bot address <b class="mono">${info.bot}</b> · balance ${info.botEth == null ? '?' : info.botEth.toFixed(5)} ETH. Keep ~0.002 ETH on it for gas (agent trades, payroll, LP moves). If your wallet caps gas (some wallets stop at 1.2M), use <b>bot pays gas</b>: the bot deploys and hands admin rights to you.` : 'Add a secret named BOT_PRIVATE_KEY in Cloudflare (Settings → Variables). Use a brand-new wallet that holds only a little gas ETH.'}</p>
+      <p class="hint">Hyperliquid key encryption (HL_SECRET): ${info.hlSecret ? 'set' : 'not set — Hyperliquid live agents stay off'}.</p></div>
+    <div class="card step"><h3>1 · AgentVaultFactory ${done('agentVaultFactory')}</h3><p class="hint">Live trading vaults. Uses the 13 tokens, Chainlink feeds and pinned Uniswap pools. New vaults get the bot as operator.</p>${c.agentVaultFactory ? `<pre>${c.agentVaultFactory}</pre>` : btns('avf', 'Deploy')}</div>
+    <div class="card step"><h3>2 · PayrollFactory ${done('payrollFactory')}</h3><p class="hint">USDG payroll vaults.</p>${c.payrollFactory ? `<pre>${c.payrollFactory}</pre>` : btns('pf', 'Deploy')}</div>
+    <div class="card step"><h3>3 · OrlaHook ${done('hook')}</h3><p class="hint">Uniswap v4 hook (fee 0.05% → 1%, +0.005% per tick). Its address must encode its permissions, so a salt is mined in your browser and it is deployed through the standard CREATE2 deployer.</p>${c.hook ? `<pre>${c.hook}</pre>` : btns('hook', 'Mine salt & deploy')}</div>
+    <div class="card step"><h3>4 · OrlaLPVaultFactory ${done('lpFactory')}</h3>${c.lpFactory ? `<pre>${c.lpFactory}</pre>` : btns('lpf', 'Deploy')}</div>
+    <div class="card step"><h3>5 · OrlaSwapRouter ${done('swapRouter')}</h3>${c.swapRouter ? `<pre>${c.swapRouter}</pre>` : btns('router', 'Deploy')}</div>
+    <div class="card step"><h3>6 · Register & initialize the WETH/USDG pool ${done('poolInitialized')}</h3><p class="hint">Registers the pool on the hook (you become its owner) and initializes it at the current ETH price. Liquidity comes from LP vaults on the Pools page.</p>${c.poolInitialized ? '<pre>initialized</pre>' : (c.hook ? btns('pool', 'Register & initialize') : '<button class="btn primary" disabled>Register & initialize</button>')}</div>
+    <div class="card step"><h3>7 · Token & links</h3><label class="f">$ORLA contract address</label><input class="inp mono" id="sTok" value="${esc(c.token || '')}" placeholder="0x… (after launch)"><div class="row2"><div><label class="f">X URL</label><input class="inp" id="sX" value="${esc(c.x || '')}" placeholder="https://x.com/…"></div><div><label class="f">GitHub URL</label><input class="inp" id="sGh" value="${esc(c.github || '')}" placeholder="https://github.com/…"></div></div><button class="btn" id="sSave" style="margin-top:12px">Save</button></div>
+    ${claimCard}
+    <div class="card step"><h3>Engine</h3><p class="hint">The engine runs every 5 minutes by itself (Cron Trigger). You can also run it now.</p><button class="btn" id="sRun">Run jobs now</button><pre id="sOut" class="hide"></pre></div>`;
+    const save = (o) => postJSON('/api/setup/save', o);
+    const deploy = async (label, abiX, bytecode, args) => {
+      const { w, p } = await wallet();
+      toast(`<b><span class="spin"></span> ${label}</b><div class="m">Confirm in your wallet…</div>`, 0);
+      // wallets sometimes cap contract creations at ~1.2M gas: set the limit ourselves
+      const v = await V();
+      const data = v.encodeDeployData({ abi: abiX, bytecode, args });
+      const est = await p.estimateGas({ account: w.account.address, data }).catch(() => null);
+      const floor = BigInt(Math.ceil(((data.length - 2) / 2) * 260 + 1_500_000));
+      const gas = est ? (est * 13n) / 10n > floor ? (est * 13n) / 10n : floor : floor;
+      const hash = await w.sendTransaction({ data, gas });
+      const rc = await p.waitForTransactionReceipt({ hash, timeout: 120_000 });
+      if (rc.status !== 'success' || !rc.contractAddress) throw new Error('Deployment failed');
+      toast(`<b><i></i>${label} deployed</b><div class="m">${rc.contractAddress}</div>`);
+      return { address: rc.contractAddress, block: Number(rc.blockNumber) };
+    };
+    const T = info.tokens;
+    $$('[data-d]').forEach((b) => (b.onclick = async () => {
+      try {
+        b.disabled = true;
+        const k = b.dataset.d;
+        if (!info.bot && ['avf', 'lpf'].includes(k)) throw new Error('Set BOT_PRIVATE_KEY first: the factory needs the bot address.');
+        if (k === 'avf') {
+          const r = await deploy('AgentVaultFactory', a.abi.AgentVaultFactory, B.AgentVaultFactory, [a.uni.swapRouter02, info.bot, T.map((t) => t.address), T.map((t) => t.feed), T.map((t) => t.maxStaleness), T.map((t) => t.feeTier || 0)]);
+          await save({ agentVaultFactory: r.address });
+        }
+        if (k === 'pf') { const r = await deploy('PayrollFactory', a.abi.PayrollFactory, B.PayrollFactory, [T.find((t) => t.symbol === 'USDG').address]); await save({ payrollFactory: r.address }); }
+        if (k === 'lpf') { const r = await deploy('OrlaLPVaultFactory', a.abi.OrlaLPVaultFactory, B.OrlaLPVaultFactory, [a.uni.poolManager, info.bot]); await save({ lpFactory: r.address }); }
+        if (k === 'router') { const r = await deploy('OrlaSwapRouter', a.abi.OrlaSwapRouter, B.OrlaSwapRouter, [a.uni.poolManager]); await save({ swapRouter: r.address }); }
+        if (k === 'hook') {
+          const v = await V();
+          const init = v.concat([B.OrlaHook, v.encodeAbiParameters([{ type: 'address' }, { type: 'uint24' }, { type: 'uint24' }, { type: 'uint24' }], [a.uni.poolManager, 500, 10000, 50])]);
+          const initHash = v.keccak256(init);
+          const FLAGS = 0x20c4, MASK = 0x3fff;
+          toast('<b><span class="spin"></span> Mining a hook salt…</b><div class="m">Usually a few seconds.</div>', 0);
+          let salt, addr;
+          const dep = a.uni.create2.toLowerCase().slice(2);
+          for (let i = 0; i < 2_000_000; i++) {
+            salt = '0x' + i.toString(16).padStart(64, '0');
+            const h = v.keccak256('0xff' + dep + salt.slice(2) + initHash.slice(2));
+            if ((parseInt(h.slice(-4), 16) & MASK) === FLAGS) { addr = v.getAddress('0x' + h.slice(-40)); break; }
+            if (i % 5000 === 0) await sleep(0);
+          }
+          if (!addr) throw new Error('No salt found');
+          const { w, p } = await wallet();
+          toast(`<b><span class="spin"></span> Deploying OrlaHook</b><div class="m">${addr}</div>`, 0);
+          const hdata = v.concat([salt, init]);
+          const hest = await p.estimateGas({ account: w.account.address, to: a.uni.create2, data: hdata }).catch(() => null);
+          const hfloor = BigInt(Math.ceil(((hdata.length - 2) / 2) * 260 + 1_500_000));
+          const hgas = hest ? (hest * 13n) / 10n > hfloor ? (hest * 13n) / 10n : hfloor : hfloor;
+          const hash = await w.sendTransaction({ to: a.uni.create2, data: hdata, gas: hgas });
+          await p.waitForTransactionReceipt({ hash, timeout: 120_000 });
+          const code = await p.getCode({ address: addr });
+          if (!code || code === '0x') throw new Error('Hook not found at ' + addr);
+          await save({ hook: addr, hookSalt: salt });
+          toast(`<b><i></i>OrlaHook deployed</b><div class="m">${addr}</div>`);
+        }
+        if (k === 'pool') {
+          const v = await V();
+          const key = { currency0: T.find((t) => t.symbol === 'WETH').address, currency1: T.find((t) => t.symbol === 'USDG').address, fee: 0x800000, tickSpacing: 60, hooks: c.hook };
+          const { p } = await wallet();
+          const pc = await p.readContract({ address: c.hook, abi: a.abi.OrlaHook, functionName: 'pools', args: [v.keccak256(v.encodeAbiParameters([{ type: 'address' }, { type: 'address' }, { type: 'uint24' }, { type: 'int24' }, { type: 'address' }], [key.currency0, key.currency1, key.fee, key.tickSpacing, key.hooks]))] });
+          if (/^0x0+$/.test(pc[0])) await tx('Register pool', (w) => w.writeContract({ address: c.hook, abi: a.abi.OrlaHook, functionName: 'registerPool', args: [key, '0x0000000000000000000000000000000000000000', 0] }));
+          const { bars } = await getJSON('/api/candles?market=crypto:ETH&hours=24');
+          const eth = bars[bars.length - 1].c;
+          const sqrt = BigInt(Math.floor(Math.sqrt(eth * 1e-12) * 2 ** 48)) * 2n ** 48n; // sqrt(price) * 2^96, USDG(6) per WETH(18)
+          const PM = [{ type: 'function', name: 'initialize', stateMutability: 'nonpayable', inputs: [{ name: 'key', type: 'tuple', components: [{ name: 'currency0', type: 'address' }, { name: 'currency1', type: 'address' }, { name: 'fee', type: 'uint24' }, { name: 'tickSpacing', type: 'int24' }, { name: 'hooks', type: 'address' }] }, { name: 'sqrtPriceX96', type: 'uint160' }], outputs: [{ type: 'int24' }] }];
+          const rc = await tx('Initialize pool', (w) => w.writeContract({ address: a.uni.poolManager, abi: PM, functionName: 'initialize', args: [key, sqrt] }));
+          await save({ poolInitialized: true, poolBlock: Number(rc.blockNumber), poolSince: Date.now() });
+        }
+        draw();
+      } catch (e) { toast(`<b style="color:var(--down)">Setup step failed</b><div class="m">${esc(e.shortMessage || e.message)}</div>`, 10000); b.disabled = false; }
+    }));
+    $$('[data-b]').forEach((b) => (b.onclick = async () => {
+      const k = b.dataset.b;
+      try {
+        $$('[data-b],[data-d]').forEach((x) => (x.disabled = true));
+        let salt;
+        if (k === 'hook') {
+          const v = await V();
+          const init = v.concat([B.OrlaHook, v.encodeAbiParameters([{ type: 'address' }, { type: 'uint24' }, { type: 'uint24' }, { type: 'uint24' }], [a.uni.poolManager, 500, 10000, 50])]);
+          const initHash = v.keccak256(init), dep = a.uni.create2.toLowerCase().slice(2);
+          toast('<b><span class="spin"></span> Mining a hook salt…</b><div class="m">Usually a few seconds.</div>', 0);
+          for (let i = 0; i < 2_000_000; i++) {
+            const sx = '0x' + i.toString(16).padStart(64, '0');
+            const h = v.keccak256('0xff' + dep + sx.slice(2) + initHash.slice(2));
+            if ((parseInt(h.slice(-4), 16) & 0x3fff) === 0x20c4) { salt = sx; break; }
+            if (i % 5000 === 0) await sleep(0);
+          }
+          if (!salt) throw new Error('No salt found');
+        }
+        toast('<b><span class="spin"></span> The bot is deploying…</b><div class="m">No wallet popup. This can take up to a minute.</div>', 0);
+        const r = await postJSON('/api/setup/bot', { step: k, salt });
+        toast(`<b><i></i>Done</b><div class="m">${esc(r.address || 'pool ready')}${r.pendingAdmin ? ' · accept admin in step 8' : ''}</div>`, 8000);
+        draw();
+      } catch (e) { toast(`<b style="color:var(--down)">Setup step failed</b><div class="m">${esc(e.message)}</div>`, 12000); $$('[data-b],[data-d]').forEach((x) => (x.disabled = false)); }
+    }));
+    $$('[data-claim]').forEach((b) => (b.onclick = async () => {
+      try { b.disabled = true; await tx('Accept admin', (w) => w.writeContract({ address: b.dataset.claim, abi: ADM, functionName: 'acceptAdmin', args: [], gas: 120000n })); draw(); }
+      catch (_) { b.disabled = false; }
+    }));
+    $('#sSave').onclick = async () => { await save({ token: $('#sTok').value.trim() || null, x: $('#sX').value.trim() || null, github: $('#sGh').value.trim() || null }); toast('<b><i></i>Saved</b>'); };
+    $('#sRun').onclick = async () => { $('#sOut').classList.remove('hide'); $('#sOut').textContent = 'running…'; try { const r = await postJSON('/api/setup/run'); $('#sOut').textContent = JSON.stringify(r.health, null, 2); } catch (e) { $('#sOut').textContent = e.message; } };
+  };
+  document.addEventListener('orla:session', draw);
+  await loadSession();
+  draw();
+};
+
+// ------------------------------------------------------------------ boot
+(async () => {
+  if (!pages[PAGE] || ['home', 'markets', 'leaderboard', 'token', 'docs'].includes(PAGE)) loadSession();
+  try { await pages[PAGE]?.(); } catch (e) { console.error(e); }
+})();

@@ -1,0 +1,19 @@
+{
+  "name": "orla-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "ORLA: no-code trading agents, vaults, payroll and hooked pools on Robinhood Chain (Cloudflare Worker).",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs --min",
+    "test": "node build.mjs && node test/e2e.mjs && node test/fallback.mjs"
+  },
+  "dependencies": {
+    "esbuild": "^0.28.2",
+    "viem": "^2.58.0",
+    "wrangler": "^3.114.17"
+  },
+  "devDependencies": {
+    "miniflare": "^3.20250214.0"
+  }
+}

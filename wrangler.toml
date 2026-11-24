@@ -1,0 +1,14 @@
+name = "orla"
+main = "dist/worker.js"
+compatibility_date = "2024-11-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "orla"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+ADMIN_ADDRESS = "0x000000000000000000000000000000000000dEaD"
